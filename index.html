@@ -537,7 +537,7 @@ const buildCSV=(rows,cols,maps)=>{
 };
 const dlAll=async(temps,huiles,services,cellules,ncs,setCsvReady)=>{
   const moisPrec=new Date(); moisPrec.setDate(0);
-  const mois=new Date(moisPrec.getFullYear(),moisPrec.getMonth(),1).toISOString().slice(0,7);
+  const mois=`${moisPrec.getFullYear()}-${String(moisPrec.getMonth()+1).padStart(2,'0')}`;
   const inM=(iso)=>iso&&(iso.startsWith(mois));
   const nomMois=new Date(moisPrec.getFullYear(),moisPrec.getMonth(),1).toLocaleDateString("fr-FR",{month:"long",year:"numeric"});
   const fichiers=[
