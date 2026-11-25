@@ -122,6 +122,140 @@ const pndSave = (arr) => {
 
 const POSTES_SERVICE = ["Bain-marie 1","Bain-marie 2","Lampe chauffante","Vitrine chaude","Plancha (maintien)","Poêlon / casserole","Autre"];
 const PRODUITS_CELLULE = ["Viande rôtie / braisée","Poulet / Volaille","Poisson / Fruits de mer","Sauce / Jus / Fond","Riz / Céréales","Légumes cuits","Friture / Pané","Préparation pâtissière","Autre"];
+
+// ── Cellule : modes de cycle ──
+// refroid : +63°C → ≤ +10°C en 2h (Arrêté 21/12/2009)
+// surgel  : → ≤ -18°C à cœur, 4h30 max (référence pro des cellules, pas un seuil légal)
+const CELL_MODES = {
+  refroid:{ label:"Refroidissement", short:"Refroid.", icon:"❄", limite:120, cible:10,  cibleTxt:"≤ +10°C", color:"#0369a1", bg:"#f0f9ff", border:"#38bdf8" },
+  surgel: { label:"Surgélation",     short:"Surgél.",  icon:"🧊", limite:270, cible:-18, cibleTxt:"≤ −18°C", color:"#6d28d9", bg:"#f5f3ff", border:"#a78bfa" },
+};
+const CELL_CAPACITE = 5; // Tecnodom BSF ATT05 : 5 niveaux GN1/1
+const cellMode = (c) => CELL_MODES[c&&c.mode==="surgel"?"surgel":"refroid"];
+// Jalons d'alarme (minutes) : mi-parcours, 15 min avant la fin, dépassement
+const cellJalons = (m) => [
+  { k:"mi",   at:Math.round(m.limite/2), titre:"Mi-parcours", txt:"Sonder le produit à cœur" },
+  { k:"fin",  at:m.limite-15,            titre:"Fin dans 15 min", txt:"Sonder et préparer la sortie" },
+  { k:"over", at:m.limite,               titre:"TEMPS DÉPASSÉ", txt:"Sonder tout de suite · ouvrir une fiche Problème si non conforme" },
+];
+const CELL_PRESETS_DEFAULT = [
+  { id:"c1", icon:"🍲", label:"Soupe / Sauce",      mode:"refroid" },
+  { id:"c2", icon:"🍖", label:"Viande / Volaille",  mode:"refroid" },
+  { id:"c3", icon:"🍚", label:"Riz / Pâtes / Légumineuses", mode:"refroid" },
+  { id:"c4", icon:"🥕", label:"Légumes",            mode:"refroid" },
+  { id:"c5", icon:"🍟", label:"Frites (1er bain)",  mode:"refroid" },
+  { id:"c6", icon:"✏️", label:"Autre",              mode:"refroid", ask:true },
+  { id:"s1", icon:"🍖", label:"Viande / Volaille",  mode:"surgel" },
+  { id:"s2", icon:"🍲", label:"Soupe / Sauce",      mode:"surgel" },
+  { id:"s3", icon:"✏️", label:"Autre",              mode:"surgel", ask:true },
+];
+const cellPresetsLoad = () => { try{ const v=localStorage.getItem("bc_cell_presets_v2"); return v?JSON.parse(v):CELL_PRESETS_DEFAULT; }catch(e){ return CELL_PRESETS_DEFAULT; } };
+const cellPresetsSave = (arr) => {
+  try{ localStorage.setItem("bc_cell_presets_v2",JSON.stringify(arr)); }catch(e){}
+  if(db){ try{ db.ref("haccp/cellPresets2").set(JSON.stringify(arr)); }catch(e){} }
+};
+const CELL_DLC_SURGEL_DEFAULT = 30; // jours — modifiable dans Réglages › Cellule
+const cellDlcLoad = () => { const v=parseInt(localStorage.getItem("bc_cell_dlc")||""); return isNaN(v)?CELL_DLC_SURGEL_DEFAULT:v; };
+const cellDlcSave = (n) => {
+  try{ localStorage.setItem("bc_cell_dlc",String(n)); }catch(e){}
+  if(db){ try{ db.ref("haccp/cellDlc").set(String(n)); }catch(e){} }
+};
+
+// ── Planning de la cuisine (partagé entre appareils via Firebase) ──
+// jours : 1=lun … 6=sam, 0=dim · midi/soir cochés = service travaillé
+const JOURS = [[1,"Lundi"],[2,"Mardi"],[3,"Mercredi"],[4,"Jeudi"],[5,"Vendredi"],[6,"Samedi"],[0,"Dimanche"]];
+const PLANNING_DEFAULT = {
+  jours:{ 1:{midi:true,soir:true}, 2:{midi:true,soir:true}, 3:{midi:true,soir:true}, 4:{midi:true,soir:true}, 5:{midi:true,soir:true}, 6:{midi:false,soir:true}, 0:{midi:false,soir:true} },
+  midi:{ debut:9,  fin:15 },
+  soir:{ debut:18, fin:23 },
+};
+const planningLoad = () => { try{ const v=localStorage.getItem("bc_planning"); return v?JSON.parse(v):PLANNING_DEFAULT; }catch(e){ return PLANNING_DEFAULT; } };
+const planningSave = (p) => {
+  try{ localStorage.setItem("bc_planning",JSON.stringify(p)); }catch(e){}
+  if(db){ try{ db.ref("haccp/planning").set(JSON.stringify(p)); }catch(e){} }
+};
+// Services travaillés un jour donné : [{k:"midi",debut,fin},{k:"soir",…}]
+const servicesDuJour = (pl, d=new Date()) => {
+  const j=(pl&&pl.jours&&pl.jours[d.getDay()])||{};
+  const out=[];
+  if(j.midi) out.push({k:"midi",...pl.midi});
+  if(j.soir) out.push({k:"soir",...pl.soir});
+  return out;
+};
+const hDec = (d=new Date()) => d.getHours()+d.getMinutes()/60;
+const enService = (pl, d=new Date()) => servicesDuJour(pl,d).some(s=>hDec(d)>=s.debut&&hDec(d)<s.fin);
+const fH = (h) => { const hh=Math.floor(h), mm=Math.round((h-hh)*60); return `${hh}h${mm?String(mm).padStart(2,"0"):""}`; };
+// Créneaux de rappel calculés depuis le planning :
+//  · relevé T° 30 min après le début de chaque service (+ 1 h avant la fin du midi s'il n'y a qu'un service)
+//  · ménage 45 min avant la fin du dernier service
+const creneauxTemps = (pl, d=new Date()) => {
+  const sv=servicesDuJour(pl,d); const out=[];
+  sv.forEach((s,i)=>out.push({id:`t_${s.k}`, h:s.debut+0.5, need:i+1, label:`Relevé T° ${s.k==="midi"?"du midi":"du soir"}`}));
+  if(sv.length===1) out.push({id:`t_${sv[0].k}2`, h:sv[0].fin-1, need:2, label:"2e relevé T° de la journée"});
+  return out;
+};
+const creneauxMenage = (pl, d=new Date()) => {
+  const sv=servicesDuJour(pl,d); if(!sv.length) return [];
+  const last=sv[sv.length-1]; return [{id:`m_${last.k}`, h:last.fin-0.75, label:"Ménage de clôture"}];
+};
+// Identifiant de CET appareil : les alarmes cellule ne sonnent que sur l'appareil qui a lancé le cycle
+const DEVICE_ID = (()=>{ try{ let v=localStorage.getItem("bc_device_id"); if(!v){ v="d"+Date.now().toString(36)+Math.random().toString(36).slice(2,7); localStorage.setItem("bc_device_id",v); } return v; }catch(e){ return "d_inconnu"; } })();
+
+// ── Réglages alarmes (propres à chaque appareil) ──
+const ALARM_CFG_DEFAULT = { on:true, cellule:true, temps:true, menage:true, horaires:true, wake:false };
+const alarmCfgLoad = () => { try{ const v=localStorage.getItem("bc_alarm_cfg"); return v?{...ALARM_CFG_DEFAULT,...JSON.parse(v)}:ALARM_CFG_DEFAULT; }catch(e){ return ALARM_CFG_DEFAULT; } };
+const alarmCfgSave = (c) => { try{ localStorage.setItem("bc_alarm_cfg",JSON.stringify(c)); }catch(e){} };
+
+// ── Son : WAV généré en JS (lu via <audio>, plus fiable sur iPhone que WebAudio) ──
+const makeWav = (pattern) => {
+  const sr=22050, parts=[];
+  pattern.forEach(([f,dur])=>{ const n=Math.floor(sr*dur); for(let i=0;i<n;i++){ const env=Math.min(1,i/200,(n-i)/200); let x=f?Math.sin(2*Math.PI*f*i/sr)+0.5*Math.sin(6*Math.PI*f*i/sr):0; x=Math.max(-0.8,Math.min(0.8,x))/0.8; parts.push(x*0.98*env); } });
+  const buf=new ArrayBuffer(44+parts.length*2), v=new DataView(buf);
+  const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  w(0,"RIFF"); v.setUint32(4,36+parts.length*2,true); w(8,"WAVE"); w(12,"fmt ");
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true); v.setUint32(24,sr,true);
+  v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true); w(36,"data"); v.setUint32(40,parts.length*2,true);
+  parts.forEach((s,i)=>v.setInt16(44+i*2,Math.max(-1,Math.min(1,s))*32767,true));
+  return URL.createObjectURL(new Blob([buf],{type:"audio/wav"}));
+};
+const SONS = {};
+// « rappel » : bip-bip-bip réveil (2,4 kHz — perce le bruit grave des hottes)
+// « urgent » : sirène rapide 2 tons, pour un temps de cellule dépassé
+const getSon = (type) => {
+  if(!SONS[type]){
+    const p = type==="urgent"
+      ? [[2600,.12],[1900,.12],[2600,.12],[1900,.12],[2600,.12],[1900,.12],[0,.08]]
+      : [[2400,.13],[0,.07],[2400,.13],[0,.07],[2400,.13],[0,.07],[2400,.13],[0,.45]];
+    const a=new Audio(makeWav(p)); a.preload="auto"; SONS[type]=a;
+  }
+  return SONS[type];
+};
+// Sonnerie en boucle jusqu'à intervention (comme un réveil)
+let SONNERIE=null, VIBRE=null;
+const startSonnerie = (type="rappel") => {
+  if(SONNERIE===type) return;
+  stopSonnerie();
+  SONNERIE=type;
+  try{ const a=getSon(type); a.loop=true; a.volume=1; a.currentTime=0; const p=a.play(); if(p&&p.catch) p.catch(()=>{}); }catch(e){}
+  try{ if(navigator.vibrate){ const v=()=>{ try{ navigator.vibrate(type==="urgent"?[400,150,400,150,400]:[600,300,600]); }catch(e){} }; v(); VIBRE=setInterval(v,1600); } }catch(e){}
+};
+const stopSonnerie = () => {
+  SONNERIE=null;
+  ["rappel","urgent"].forEach(t=>{ try{ const a=SONS[t]; if(a){ a.loop=false; a.pause(); a.currentTime=0; } }catch(e){} });
+  if(VIBRE){ clearInterval(VIBRE); VIBRE=null; }
+  try{ if(navigator.vibrate) navigator.vibrate(0); }catch(e){}
+};
+// Un seul passage (bouton « Tester le son »)
+const playSon = (type="rappel") => {
+  try{ const a=getSon(type); a.loop=false; a.currentTime=0; const p=a.play(); if(p&&p.catch) p.catch(()=>{}); }catch(e){}
+};
+// iOS/Android : le son n'est autorisé qu'après un premier appui → on « déverrouille » au 1er toucher
+const unlockSons = () => {
+  ["rappel","urgent"].forEach(t=>{ try{ const a=getSon(t); if(SONNERIE===t){ a.muted=false; a.loop=true; const p=a.play(); if(p&&p.catch) p.catch(()=>{}); return; } a.muted=true; const p=a.play(); if(p&&p.then) p.then(()=>{ if(SONNERIE!==t){a.pause();a.currentTime=0;} a.muted=false;}).catch(()=>{a.muted=false;}); else a.muted=false; }catch(e){} });
+};
+const notifier = (title,body) => {
+  try{ if("Notification" in window && Notification.permission==="granted") new Notification(title,{body}); }catch(e){}
+};
 const CATEGORIES_NC = ["Température hors plage","Rupture chaîne du froid","Produit périmé / DLC dépassée","Livraison refusée","Contamination croisée","Nuisible détecté","Huile de friture non conforme","Hygiène du personnel","Matériel défaillant","Autre"];
 
 const TYPES_LIVRAISON = ["Surgelé","Frais","Sec / Épicerie","Charcuterie / Fromage","Boissons","Mixte"];
@@ -177,11 +311,40 @@ const COULEURS=[
   {v:3,label:"Ambrée",bg:"#d97706",txt:"#fef9e7"},{v:4,label:"Brune",bg:"#7c2d12",txt:"#fef9e7"},
   {v:5,label:"Noire", bg:"#1c0a00",txt:"#fca5a5"},
 ];
+// Décision : contrôle visuel + olfactif (TPM pris en compte seulement s'il est mesuré)
 const huileDecision=(tpm,col,odeur,mousse)=>{
-  const tv=parseFloat(tpm); if(isNaN(tv)) return null;
-  if(tv>25||col>=4||odeur!=="OK"||mousse==="Oui") return "Changement immédiat";
-  if(tv>20||col>=3) return "Surveiller";
+  const tv=parseFloat(tpm); const t=!isNaN(tv);
+  if((t&&tv>25)||col>=4||odeur!=="OK"||mousse==="Oui") return "Changement immédiat";
+  if((t&&tv>20)||col>=3) return "Surveiller";
   return "Maintien";
+};
+// ── Cycle d'huile : nb de services travaillés (planning) depuis le dernier changement ──
+const HUILE_CYCLE_DEFAULT = 8; // services entre 2 changements — à ajuster dans le module Huile
+const huileCycleLoad = () => { const v=parseInt(localStorage.getItem("bc_huile_cycle")||""); return v>0?v:HUILE_CYCLE_DEFAULT; };
+const huileCycleSave = (n) => { try{ localStorage.setItem("bc_huile_cycle",String(n)); }catch(e){} if(db){ try{ db.ref("haccp/huileCycle").set(String(n)); }catch(e){} } };
+const servicesDepuis = (iso, pl, now=new Date()) => {
+  if(!iso) return null;
+  const debut=new Date(iso); let n=0;
+  const d=new Date(debut); d.setHours(0,0,0,0);
+  while(d<=now){
+    servicesDuJour(pl,d).forEach(s=>{
+      const deb=new Date(d); deb.setHours(Math.floor(s.debut),Math.round((s.debut%1)*60),0,0);
+      const fin=new Date(d); fin.setHours(Math.floor(s.fin),Math.round((s.fin%1)*60),0,0);
+      if(fin>debut && deb<=now) n++; // service entamé après le changement
+    });
+    d.setDate(d.getDate()+1);
+  }
+  return n;
+};
+// Couleur attendue selon l'avancée du cycle (suggestion seulement — l'agent vérifie et corrige)
+const huileSuggestion = (n, cycle) => {
+  if(n==null) return { col:1, txt:"Aucun changement enregistré : vérifier à l'œil." };
+  const r=n/cycle;
+  const col = r<0.3?1 : r<0.7?2 : 3;
+  const txt = r>=1 ? `Cycle atteint (${n}/${cycle} services) : changement d'huile conseillé.`
+            : r>=0.7 ? `Fin de cycle proche (${n}/${cycle} services) : prévoir le changement.`
+            : `${n}/${cycle} services depuis le changement.`;
+  return { col, txt, r };
 };
 
 // ══════ LOGIN ══════════════════════════════════
@@ -283,6 +446,12 @@ function AppMain({onLogout}){
   const [fourns,     setFourns]    = useState(fournsLoad);
   const [unites,     setUnites]    = useState(unitesLoad);
   const [pndPlan,    setPndPlan]   = useState(pndLoad);
+  const [cellPresets,setCellPresets]= useState(cellPresetsLoad);
+  const [cellDlc,    setCellDlc]   = useState(cellDlcLoad);
+  const [planning,   setPlanning]  = useState(planningLoad);
+  const [alarmCfg,   setAlarmCfg]  = useState(alarmCfgLoad);
+  const [alarms,     setAlarms]    = useState([]);
+  const [acks,       setAcks]      = useState(()=>{ try{ return JSON.parse(localStorage.getItem("bc_alarm_acks")||"{}"); }catch(e){ return {}; } });
 
   useEffect(()=>{
     const pairs=[["temps",setTemps],["huiles",setHuiles],["nc",setNcs],["cellule",setCellules],["service",setServices],["nettoyage",setNettoyages]];
@@ -322,52 +491,89 @@ function AppMain({onLogout}){
     setReady(true);
     if(db){db.ref(".info/connected").on("value",snap=>{setFbOk(snap.val()===true);});}
 
-    // ── NOTIFICATIONS PUSH ──
-    if("Notification" in window && Notification.permission==="default"){
-      Notification.requestPermission();
-    }
-    // Vérification toutes les 15 minutes — envoie une notif si rappel actif
-    const checkNotif=()=>{
-      if(Notification.permission!=="granted") return;
-      const h=new Date().getHours();
-      const t=JSON.parse(localStorage.getItem("bc_v2_temps")||"[]");
-      const s=JSON.parse(localStorage.getItem("bc_v2_service")||"[]");
-      const hu=JSON.parse(localStorage.getItem("bc_v2_huiles")||"[]");
-      const ne=JSON.parse(localStorage.getItem("bc_v2_nettoyage")||"[]");
-      const tAuj=t.filter(x=>sameKDay(x.ts));
-      const sAuj=s.filter(x=>sameKDay(x.ts));
-      const huAuj=hu.filter(x=>sameKDay(x.ts));
-      const neAuj=ne.filter(x=>sameKDay(x.ts));
-      const pndJour=(pndLoad()||PND_DEFAULT).filter(p=>p.freq==="Journalier");
-      const pndDone=pndJour.filter(p=>neAuj.some(n=>n.tacheId===p.id));
-      const lastNotif=parseInt(localStorage.getItem("bc_last_notif")||"0");
-      const now=Date.now();
-      if(now-lastNotif<55*60*1000) return; // max 1 notif/heure
-      let msg=null;
-      if(h>=RAPPEL_OUVERTURE-1&&h<RAPPEL_OUVERTURE+2&&tAuj.length===0)
-        msg={title:"🌡 HACCP Black Cat",body:"Relevé T° frigos non effectué ce matin !"};
-      else if(h>=RAPPEL_SERVICE-1&&h<RAPPEL_SERVICE+3&&sAuj.length===0)
-        msg={title:"🔥 HACCP Black Cat",body:"T° service chaud non contrôlée — à faire avant le service !"};
-      else if(h>=RAPPEL_SERVICE-1&&h<RAPPEL_SERVICE+3&&huAuj.length===0)
-        msg={title:"⚗ HACCP Black Cat",body:"Contrôle huile friture non fait aujourd'hui !"};
-      else if(h>=RAPPEL_CLOTURE-1&&h<RAPPEL_CLOTURE+2&&pndDone.length<pndJour.length)
-        msg={title:"🧹 HACCP Black Cat",body:`${pndJour.length-pndDone.length} tâche(s) ménage non validée(s) ce soir !`};
-      else if(h>=RAPPEL_CLOTURE-1&&h<RAPPEL_CLOTURE+2&&tAuj.length<2)
-        msg={title:"🌡 HACCP Black Cat",body:"2e relevé T° frigos manquant — à faire avant fermeture !"};
-      if(msg){
-        new Notification(msg.title,{body:msg.body,icon:"/favicon.ico"});
-        localStorage.setItem("bc_last_notif",String(now));
-      }
-    };
-    const notifInterval=setInterval(checkNotif,15*60*1000);
-    setTimeout(checkNotif,3000); // premier check 3s après ouverture
-    return()=>{unsubs.forEach(fn=>fn()); unsubAgents(); clearInterval(notifInterval);};
+    // ── Réglages partagés : boutons cellule, DLC surgélation, planning ──
+    const shared=[["cellPresets2","bc_cell_presets_v2",v=>Array.isArray(v)&&v.length&&setCellPresets(v)],
+                  ["cellDlc","bc_cell_dlc",v=>{const n=parseInt(v); if(n>0) setCellDlc(n);}],
+                  ["planning","bc_planning",v=>v&&v.jours&&setPlanning(v)],
+                  ["huileCycle","bc_huile_cycle",()=>{}]];
+    const unsubShared=shared.map(([k,lsk,set])=>{
+      if(!db) return ()=>{};
+      const ref=db.ref("haccp/"+k);
+      ref.on("value",snap=>{ try{ const raw=snap.val(); if(raw==null) return; const v=JSON.parse(raw); set(v); localStorage.setItem(lsk,typeof v==="object"?JSON.stringify(v):String(v)); }catch(e){} });
+      return ()=>ref.off();
+    });
+    // Le son n'est autorisé qu'après un 1er appui (iPhone / Android)
+    const unlock=()=>{ unlockSons(); document.removeEventListener("pointerdown",unlock); };
+    document.addEventListener("pointerdown",unlock);
+    if("Notification" in window && Notification.permission==="default"){ try{ Notification.requestPermission(); }catch(e){} }
+    return()=>{unsubs.forEach(fn=>fn()); unsubAgents(); unsubShared.forEach(fn=>fn()); document.removeEventListener("pointerdown",unlock);};
   },[]);
   const save=async(key,set,data)=>{set(data);lsSave(key,data);setSyncing(true);await dbSave(key,data);setSyncing(false);};
   const saveAgents=(arr)=>{setAgents(arr);agentsSave(arr);};
   const saveFourns=(arr)=>{setFourns(arr);fournsSave(arr);};
   const saveUnites=(arr)=>{setUnites(arr);unitesSave(arr);};
   const savePnd=(arr)=>{setPndPlan(arr);pndSave(arr);};
+  // Cellule : chaque modification s'applique sur la version serveur la plus récente (transaction Firebase)
+  const patchCellules=(fn)=>{
+    setCellules(prev=>{ const n=fn(prev||[]); lsSave("cellule",n); return n; });
+    if(db){
+      setSyncing(true);
+      db.ref("haccp/cellule").transaction(cur=>{
+        let arr=null; try{ arr=cur?JSON.parse(cur):null; }catch(e){}
+        if(!Array.isArray(arr)) arr=lsLoad("cellule")||[];
+        return JSON.stringify(fn(arr));
+      }).then(()=>setSyncing(false)).catch(()=>setSyncing(false));
+    }
+  };
+  const saveCellPresets=(arr)=>{setCellPresets(arr);cellPresetsSave(arr);};
+  const saveCellDlc=(n)=>{setCellDlc(n);cellDlcSave(n);};
+  const savePlanning=(p)=>{setPlanning(p);planningSave(p);};
+  const saveAlarmCfg=(c)=>{setAlarmCfg(c);alarmCfgSave(c);};
+  const saveAcks=(o)=>{ // purge > 3 jours
+    const lim=Date.now()-3*864e5; const n={}; Object.entries(o).forEach(([k,v])=>{ const d=Date.parse(k.split("_")[0]); if(!(d&&d<lim)) n[k]=v; });
+    setAcks(n); try{ localStorage.setItem("bc_alarm_acks",JSON.stringify(n)); }catch(e){}
+  };
+
+  // ── MOTEUR D'ALARMES : vérifie toutes les 15 s, sonne à chaque nouvelle alarme puis toutes les 30 s tant que non acquittée ──
+  const dataRef=React.useRef({});
+  dataRef.current={cellules,temps,nettoyages,cfg:alarmCfg,planning,acks};
+  useEffect(()=>{
+    const check=()=>setAlarms(calcAlarmes(dataRef.current));
+    check(); const i=setInterval(check,15000);
+    return()=>{ clearInterval(i); stopSonnerie(); };
+  },[]);
+  // Sonnerie : démarre à chaque nouvelle alarme et tourne en boucle tant qu'il reste une alarme non traitée
+  const ringRef=React.useRef("");
+  useEffect(()=>{
+    const keys=alarms.map(a=>a.key);
+    if(!keys.length){ ringRef.current=""; stopSonnerie(); return; }
+    const avant=ringRef.current.split("|");
+    const nouvelle=alarms.find(a=>!avant.includes(a.key));
+    ringRef.current=keys.join("|");
+    const type=alarms.some(a=>a.niveau==="urgent")?"urgent":"rappel";
+    if(nouvelle){ stopSonnerie(); notifier(nouvelle.titre,nouvelle.txt); }
+    startSonnerie(type);
+  },[alarms]);
+  // Recalcul immédiat quand une donnée change (relevé fait → l'alarme disparaît)
+  useEffect(()=>{ setAlarms(calcAlarmes(dataRef.current)); },[cellules,temps,nettoyages,alarmCfg,planning,acks]);
+
+  // ── Écran toujours allumé (option) ──
+  useEffect(()=>{
+    if(!alarmCfg.wake||!("wakeLock" in navigator)) return;
+    let lock=null; let stop=false;
+    const get=async()=>{ try{ if(document.visibilityState==="visible"&&!stop) lock=await navigator.wakeLock.request("screen"); }catch(e){} };
+    get(); const onVis=()=>get(); document.addEventListener("visibilitychange",onVis);
+    return()=>{ stop=true; document.removeEventListener("visibilitychange",onVis); try{ lock&&lock.release(); }catch(e){} };
+  },[alarmCfg.wake]);
+
+  const ackAlarm=async(a)=>{
+    stopSonnerie();
+    if(a.cycleId){ // acquittement stocké dans le cycle → synchronisé
+      patchCellules(list=>list.map(c=>c.id===a.cycleId&&!(c.vus||[]).includes(a.jalon)?{...c,vus:[...(c.vus||[]),a.jalon]}:c));
+    } else saveAcks({...acks,[a.key]:true});
+  };
+  const snoozeAlarm=(a)=>{ stopSonnerie(); saveAcks({...acks,[a.key]:Date.now()+30*60000}); };
+  const goAlarm=(a)=>{ stopSonnerie(); if(a.tab==="cellule") ackAlarm(a); else snoozeAlarm(a); goTo(a.tab); };
   const logout=()=>{localStorage.removeItem("bc_auth");setAuthed(false);};
 
   // Raccourci : navigate + ouvre le formulaire
@@ -392,7 +598,7 @@ function AppMain({onLogout}){
   ];
 
   return(
-    <div style={{background:"#1e293b",minHeight:"100vh",maxWidth:480,margin:"0 auto"}}>
+    <div style={{background:"#f1f5f9",minHeight:"100vh",maxWidth:480,margin:"0 auto"}}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800;900&family=JetBrains+Mono:wght@500;700&display=swap');
         *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}
@@ -493,14 +699,15 @@ function AppMain({onLogout}){
 
       {/* CONTENT */}
       <div style={{padding:"16px 16px 60px"}}>
-        {tab==="dash"      && <Dashboard temps={temps} huiles={huiles} ncs={ncs} cellules={cellules} services={services} nettoyages={nettoyages} onShortcut={goTo}/>}
-        {tab==="temps"     && <ModuleTemps    temps={temps}        agents={agents} unites={unites} autoOpen={autoOpen} onSave={d=>save("temps",    setTemps,    d)}/>}
-        {tab==="service"   && <ModuleService  services={services}  agents={agents} onSave={d=>save("service",  setServices, d)}/>}
-        {tab==="huiles"    && <ModuleHuiles   huiles={huiles}      agents={agents} onSave={d=>save("huiles",   setHuiles,   d)}/>}
-        {tab==="cellule"   && <ModuleCellule  cellules={cellules}  agents={agents} onSave={d=>save("cellule",  setCellules, d)}/>}
+        <AlarmBanner alarms={alarms} onAck={ackAlarm} onSnooze={snoozeAlarm} onGo={goAlarm}/>
+        {tab==="dash"      && <Dashboard temps={temps} huiles={huiles} ncs={ncs} cellules={cellules} services={services} nettoyages={nettoyages} planning={planning} onShortcut={goTo}/>}
+        {tab==="temps"     && <ModuleTemps    temps={temps}        agents={agents} unites={unites} autoOpen={autoOpen} onShortcut={goTo} onSave={d=>save("temps",    setTemps,    d)}/>}
+        {tab==="service"   && <ModuleService  services={services}  agents={agents} onShortcut={goTo} onSave={d=>save("service",  setServices, d)}/>}
+        {tab==="huiles"    && <ModuleHuiles   huiles={huiles}      agents={agents} planning={planning} onSave={d=>save("huiles",   setHuiles,   d)}/>}
+        {tab==="cellule"   && <ModuleCellule  cellules={cellules}  agents={agents} presets={cellPresets} dlcJours={cellDlc} onShortcut={goTo} onPatch={patchCellules}/>}
         {tab==="nettoyage" && <ModuleNettoyage nettoyages={nettoyages} agents={agents} pndPlan={pndPlan} autoOpen={autoOpen} onSave={d=>save("nettoyage",setNettoyages,d)}/>}
         {tab==="nc"        && <ModuleNC       ncs={ncs}            agents={agents} autoOpen={autoOpen} onSave={d=>save("nc",       setNcs,      d)}/>}
-        {tab==="settings"  && <ModuleSettings agents={agents} onSaveAgents={saveAgents} fourns={fourns} onSaveFourns={saveFourns} unites={unites} onSaveUnites={saveUnites} pndPlan={pndPlan} onSavePnd={savePnd} onLogout={logout}/>}
+        {tab==="settings"  && <ModuleSettings agents={agents} onSaveAgents={saveAgents} fourns={fourns} onSaveFourns={saveFourns} unites={unites} onSaveUnites={saveUnites} pndPlan={pndPlan} onSavePnd={savePnd} cellPresets={cellPresets} onSaveCellPresets={saveCellPresets} cellDlc={cellDlc} onSaveCellDlc={saveCellDlc} planning={planning} onSavePlanning={savePlanning} alarmCfg={alarmCfg} onSaveAlarmCfg={saveAlarmCfg} onLogout={onLogout}/>}
       </div>
     </div>
   );
@@ -551,11 +758,11 @@ const dlAll=async(temps,huiles,services,cellules,ncs,setCsvReady)=>{
      `service_chaud_${mois}.csv`],
     [huiles.filter(h=>inM(h.ts)),
      ["Date","Heure","Friteuse","TPM (%)","Couleur","Odeur","Mousse","Décision","Agent"],
-     {Date:r=>fDate(r.ts),Heure:r=>fTime(r.ts),Friteuse:r=>r.friteuse,"TPM (%)":r=>r.tpm,Couleur:r=>r.col,Odeur:r=>r.odeur,Mousse:r=>r.mousse,"Décision":r=>r.decision,Agent:r=>r.agent},
+     {Date:r=>fDate(r.ts),Heure:r=>fTime(r.ts),Friteuse:r=>r.friteuse,"TPM (%)":r=>r.tpm??"—",Couleur:r=>r.col,Odeur:r=>r.odeur,Mousse:r=>r.mousse,"Décision":r=>r.decision,Agent:r=>r.agent},
      `huiles_${mois}.csv`],
     [cellules.filter(c=>inM(c.tsDebut)&&c.statut==="terminé"),
-     ["Date","Début","Fin","Produit","Qté","T° départ","T° fin","Durée (min)","Conforme","Agent"],
-     {Date:r=>fDate(r.tsDebut),"Début":r=>fTime(r.tsDebut),Fin:r=>r.tsFin?fTime(r.tsFin):"—",Produit:r=>r.produit,"Qté":r=>r.qte||"—","T° départ":r=>r.tDepart,"T° fin":r=>r.tFin||"—","Durée (min)":r=>r.dureeMin||"—",Conforme:r=>r.ok?"OUI":"NON",Agent:r=>r.agent},
+     ["Date","Mode","Début","Fin","Produit","T° départ","T° fin","Durée (min)","Conforme","DLC","Agent"],
+     {Date:r=>fDate(r.tsDebut),Mode:r=>cellMode(r).label,"Début":r=>fTime(r.tsDebut),Fin:r=>r.tsFin?fTime(r.tsFin)+(r.finCorrigee?" (a posteriori)":""):"—",Produit:r=>r.produit+(r.precision?" — "+r.precision:""),"T° départ":r=>r.tDepart??"—","T° fin":r=>r.tFin??"—","Durée (min)":r=>r.dureeMin??"—",Conforme:r=>r.ok?"OUI":"NON",DLC:r=>r.dlc?fDate(r.dlc):"",Agent:r=>r.agent},
      `cellule_${mois}.csv`],
     [ncs.filter(n=>inM(n.ts)),
      ["Date","Heure","Catégorie","Description","Action corrective","Agent","Statut"],
@@ -603,11 +810,11 @@ const dlAll=async(temps,huiles,services,cellules,ncs,setCsvReady)=>{
          `service_chaud_${moisAlt}.csv`],
         [huiles.filter(h=>inMAlt(h.ts)),
          ["Date","Heure","Friteuse","TPM (%)","Couleur","Odeur","Mousse","Décision","Agent"],
-         {Date:r=>fDate(r.ts),Heure:r=>fTime(r.ts),Friteuse:r=>r.friteuse,"TPM (%)":r=>r.tpm,Couleur:r=>r.col,Odeur:r=>r.odeur,Mousse:r=>r.mousse,"Décision":r=>r.decision,Agent:r=>r.agent},
+         {Date:r=>fDate(r.ts),Heure:r=>fTime(r.ts),Friteuse:r=>r.friteuse,"TPM (%)":r=>r.tpm??"—",Couleur:r=>r.col,Odeur:r=>r.odeur,Mousse:r=>r.mousse,"Décision":r=>r.decision,Agent:r=>r.agent},
          `huiles_${moisAlt}.csv`],
         [cellules.filter(c=>inMAlt(c.tsDebut)&&c.statut==="terminé"),
-         ["Date","Début","Fin","Produit","Qté","T° départ","T° fin","Durée (min)","Conforme","Agent"],
-         {Date:r=>fDate(r.tsDebut),"Début":r=>fTime(r.tsDebut),Fin:r=>r.tsFin?fTime(r.tsFin):"—",Produit:r=>r.produit,"Qté":r=>r.qte||"—","T° départ":r=>r.tDepart,"T° fin":r=>r.tFin||"—","Durée (min)":r=>r.dureeMin||"—",Conforme:r=>r.ok?"OUI":"NON",Agent:r=>r.agent},
+         ["Date","Mode","Début","Fin","Produit","T° départ","T° fin","Durée (min)","Conforme","DLC","Agent"],
+         {Date:r=>fDate(r.tsDebut),Mode:r=>cellMode(r).label,"Début":r=>fTime(r.tsDebut),Fin:r=>r.tsFin?fTime(r.tsFin)+(r.finCorrigee?" (a posteriori)":""):"—",Produit:r=>r.produit+(r.precision?" — "+r.precision:""),"T° départ":r=>r.tDepart??"—","T° fin":r=>r.tFin??"—","Durée (min)":r=>r.dureeMin??"—",Conforme:r=>r.ok?"OUI":"NON",DLC:r=>r.dlc?fDate(r.dlc):"",Agent:r=>r.agent},
          `cellule_${moisAlt}.csv`],
         [ncs.filter(n=>inMAlt(n.ts)),
          ["Date","Heure","Catégorie","Description","Action corrective","Agent","Statut"],
@@ -640,7 +847,7 @@ const dlAll=async(temps,huiles,services,cellules,ncs,setCsvReady)=>{
     const corps=encodeURIComponent(
       `Bonjour,\n\nVeuillez trouver en pièce jointe le fichier ZIP des relevés HACCP du mois de ${nomMois}.\n\n`+
       `Le fichier "${zipName}" contient :\n• Températures frigos/congélos\n• Températures service chaud\n`+
-      `• Contrôles huiles friture\n• Cycles cellule de refroidissement\n`+
+      `• Contrôles huiles friture\n• Cycles cellule (refroidissement / surgélation)\n`+
       `• Non-conformités\n\n`+
       `⚠️ Pensez à joindre le fichier ZIP depuis votre dossier Téléchargements.\n\nCordialement,\nThe Black Cat`
     );
@@ -648,7 +855,7 @@ const dlAll=async(temps,huiles,services,cellules,ncs,setCsvReady)=>{
   },1500);
 };
 
-function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
+function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,planning,onShortcut}){
   const [csvReady,setCsvReady]=React.useState(null);
   const [mensuelMasque,setMensuelMasque]=React.useState(false);
   const today=todayS();
@@ -673,7 +880,9 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
 
   // ── SERVICES MIDI/SOIR — Dimanche = soir seulement ──
   const jourSemaine=new Date().getDay();
-  const isDimanche=jourSemaine===0;
+  const svJour=servicesDuJour(planning||PLANNING_DEFAULT);
+  const midiJour=svJour.some(s=>s.k==="midi"), soirJour=svJour.some(s=>s.k==="soir");
+  const isDimanche=!midiJour; // (ancien nom conservé) : pas de service midi aujourd'hui
   const isMidi=(iso)=>{ const h=new Date(iso).getHours(); return h>=10&&h<15; };
   const isSoir=(iso)=>{ const h=new Date(iso).getHours(); return h>=17||h<6; };
   const tMidi=tAuj.filter(t=>isMidi(t.ts)); const tSoir=tAuj.filter(t=>isSoir(t.ts));
@@ -686,11 +895,11 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
     rappels.push({icon:"🌡",titre:"Relevé T° frigos à faire !",detail:"Passer en revue tous les frigos et congélos à l'ouverture.",color:"#1e40af",bg:"#eff6ff",border:"#3b82f6",tab:"temps"});
   if(!isDimanche&&heure>=10&&heure<15){
     if(sMidi.length===0) rappels.push({icon:"🔥",titre:"T° service midi à contrôler !",detail:"Sonder les plats chauds avant le service de midi.",color:"#92400e",bg:"#fff7ed",border:"#fed7aa",tab:"service"});
-    if(hMidi.length===0) rappels.push({icon:"⚗",titre:"Contrôle huile — service midi",detail:"Mesurer le TPM avant le service de midi.",color:"#7c3aed",bg:"#f5f3ff",border:"#ddd6fe",tab:"huiles"});
+    if(hMidi.length===0) rappels.push({icon:"⚗",titre:"Contrôle huile — service midi",detail:"Contrôle visuel + odeur avant le service de midi.",color:"#7c3aed",bg:"#f5f3ff",border:"#ddd6fe",tab:"huiles"});
   }
   if(heure>=17&&heure<22){
     if(sSoir.length===0) rappels.push({icon:"🔥",titre:"T° service soir à contrôler !",detail:"Sonder les plats chauds avant le service du soir.",color:"#92400e",bg:"#fff7ed",border:"#fed7aa",tab:"service"});
-    if(hSoir.length===0&&hAuj.filter(h=>h.type!=="changement").length===0) rappels.push({icon:"⚗",titre:"Contrôle huile — service soir",detail:"Mesurer le TPM avant le service du soir.",color:"#7c3aed",bg:"#f5f3ff",border:"#ddd6fe",tab:"huiles"});
+    if(hSoir.length===0&&hAuj.filter(h=>h.type!=="changement").length===0) rappels.push({icon:"⚗",titre:"Contrôle huile — service soir",detail:"Contrôle visuel + odeur avant le service du soir.",color:"#7c3aed",bg:"#f5f3ff",border:"#ddd6fe",tab:"huiles"});
   }
   if(heure>=RAPPEL_CLOTURE-1&&heure<RAPPEL_CLOTURE+2){
     if(pndPct<100) rappels.push({icon:"🧹",titre:"Tâches ménage non terminées !",detail:`${pndJour.length-pndDone.length} tâche${pndJour.length-pndDone.length>1?"s":""} restante${pndJour.length-pndDone.length>1?"s":""}. À valider avant fermeture.`,color:"#15803d",bg:"#f0fdf4",border:"#bbf7d0",tab:"nettoyage"});
@@ -704,8 +913,9 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
   const alerts=[
     ...tKO.map(t=>({msg:`🌡 ${t.unite} : ${t.temp}°C — hors plage !`,sub:fTime(t.ts)+" · "+t.agent})),
     ...sKO.map(s=>({msg:`🔥 ${s.poste} : ${s.temp}°C — trop froid !`,sub:fTime(s.ts)+" · "+s.agent})),
-    ...hKO.map(h=>({msg:`⚗ Huile ${h.friteuse} : TPM ${h.tpm}% — à changer !`,sub:fTime(h.ts)})),
+    ...hKO.map(h=>({msg:`⚗ Huile ${h.friteuse} : à changer !`,sub:fTime(h.ts)})),
     ...cKO.map(c=>({msg:`❄ Cellule NC : ${c.produit}`,sub:fDT(c.tsDebut)})),
+    ...cellules.filter(c=>c.statut==="en_cours"&&minDepuis(c.tsDebut)>cellMode(c).limite).map(c=>({msg:`❄ ${c.produit} : temps de cellule dépassé (${fDuree(minDepuis(c.tsDebut))})`,sub:"Sonder et clôturer le cycle"})),
     ...ncOpen.map(n=>({msg:`⚠ NC ouverte : ${n.categorie}`,sub:fDate(n.ts)})),
   ];
 
@@ -772,6 +982,19 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
           <span style={{marginLeft:"auto",fontSize:22,color:"#3b82f6"}}>›</span>
         </button>
 
+        {(()=>{ const ec=cellules.filter(c=>c.statut==="en_cours"); const dep=ec.filter(c=>minDepuis(c.tsDebut)>cellMode(c).limite); return (
+        <button className="shortcut" onClick={()=>onShortcut("cellule")}
+          style={{background:dep.length?"#fef2f2":"#f0f9ff",border:`2px solid ${dep.length?"#ef4444":"#38bdf8"}`,color:"#0369a1"}}>
+          <span style={{fontSize:32}}>❄</span>
+          <div style={{textAlign:"left"}}>
+            <div style={{fontSize:19,fontWeight:900,color:dep.length?"#dc2626":"#0369a1"}}>Lancer un refroidissement</div>
+            <div style={{fontSize:14,color:dep.length?"#dc2626":"#0284c7",fontWeight:600}}>
+              {ec.length===0?"Aucun cycle en cours":`${ec.length} en cellule${dep.length?` · ⚠ ${dep.length} dépassé${dep.length>1?"s":""}`:""}`}
+            </div>
+          </div>
+          <span style={{marginLeft:"auto",fontSize:22,color:"#0369a1"}}>›</span>
+        </button>); })()}
+
         <button className="shortcut" onClick={()=>onShortcut("nettoyage")}
           style={{background:"#f0fdf4",border:"2px solid #22c55e",color:"#15803d"}}>
           <span style={{fontSize:32}}>🧹</span>
@@ -832,7 +1055,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
       </div>
 
       {/* ── BADGES SERVICES MIDI/SOIR ── */}
-      <div style={{display:"grid",gridTemplateColumns:isDimanche?"1fr":"1fr 1fr",gap:8}}>
+      {svJour.length>0&&<div style={{display:"grid",gridTemplateColumns:midiJour&&soirJour?"1fr 1fr":"1fr",gap:8}}>
         {!isDimanche&&(
           <div style={{background:"#ffffff",border:"1px solid #e2e8f0",borderRadius:12,padding:"10px 12px"}}>
             <div style={{fontSize:11,color:"#94a3b8",fontWeight:800,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>🌤 Midi</div>
@@ -844,7 +1067,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
             ))}
           </div>
         )}
-        <div style={{background:"#ffffff",border:"1px solid #e2e8f0",borderRadius:12,padding:"10px 12px"}}>
+        {soirJour&&<div style={{background:"#ffffff",border:"1px solid #e2e8f0",borderRadius:12,padding:"10px 12px"}}>
           <div style={{fontSize:11,color:"#94a3b8",fontWeight:800,textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>🌙 Soir</div>
           {[["🌡",tSoir.length>0],["🔥",sSoir.length>0],["⚗",hSoir.length>0]].map(([icon,ok],i)=>(
             <div key={i} style={{display:"flex",justifyContent:"space-between",marginBottom:2}}>
@@ -852,8 +1075,8 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
               <span style={{fontSize:13,fontWeight:800,color:ok?"#15803d":heure<17?"#94a3b8":"#dc2626"}}>{ok?"✓":heure<17?"—":"À faire"}</span>
             </div>
           ))}
-        </div>
-      </div>
+        </div>}
+      </div>}
 
       {/* ── NETTOYAGE PROGRESS ── */}
       <div style={{background:"#ffffff",border:`2px solid ${pndPct===100?"#22c55e":"#e2e8f0"}`,borderRadius:14,padding:"14px 16px"}}>
@@ -874,8 +1097,8 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
         <div style={{fontSize:12,color:"#1e293b",fontWeight:800,letterSpacing:1.5,textTransform:"uppercase",marginBottom:6,fontWeight:800}}>Réglementation applicable</div>
         <div style={{fontSize:14,color:"#1e293b",lineHeight:2}}>
           Frigo : 0–4°C · Bar : ≤8°C · Congélo : ≤−18°C<br/>
-          Chaud maintenu : ≥63°C · Huile TPM : max 25%<br/>
-          Cellule : 63°C → ≤10°C en moins de 2h<br/>
+          Chaud maintenu : ≥63°C · Huile : contrôle visuel + odeur<br/>
+          Cellule : 63°C → ≤10°C en moins de 2h · surgélation ≤−18°C<br/>
           <span style={{color:"#1e293b",fontWeight:700}}>Minimum 2 relevés / jour</span>
         </div>
       </div>
@@ -886,7 +1109,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,onShortcut}){
 // ══════════════════════════════════════════════
 // MODULE TEMPÉRATURES FROIDS
 // ══════════════════════════════════════════════
-function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp}){
+function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp,onShortcut}){
   const [mode,setMode]=useState("saisie");
   const UNITES_INIT=unitesLoad(); const [uid,setUid]=useState(UNITES_INIT[0]?.id||"saladette");
   const [temp,setTemp]=useState("");
@@ -894,6 +1117,8 @@ function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp}){
   const [note,setNote]=useState("");
   const [flash,setFlash]=useState(null);
   const [edit,setEdit]=useState(null);
+  const [lastId,setLastId]=useState(null);
+  const [noteFlash,setNoteFlash]=useState(false);
 
   useEffect(()=>{ if(autoOpen) setMode("saisie"); },[autoOpen]);
   useEffect(()=>{ if(agents&&agents.length) setAgent(agents[0]); },[agents]);
@@ -909,11 +1134,14 @@ function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp}){
   };
   const submit=async()=>{
     if(!temp) return;
-    await onSave([...temps,{id:Date.now(),ts:ts(),unite:u.label,uid:u.id,type:u.type,temp:parseFloat(temp),ok,agent,note}]);
-    const wasOk=ok; setTemp(""); setNote("");
+    const id=Date.now();
+    await onSave([...temps,{id,ts:ts(),unite:u.label,uid:u.id,type:u.type,temp:parseFloat(temp),ok,agent,note:""}]);
+    const wasOk=ok; setTemp(""); setLastId(id);
     setFlash(wasOk?"ok":"nc");
     setTimeout(()=>{ setFlash(null); nextUnit(); },1600);
   };
+  const last=lastId?temps.find(t=>t.id===lastId):null;
+  const addNote=async()=>{ if(!last||!note.trim()) return; await onSave(temps.map(t=>t.id===last.id?{...t,note:[t.note,note.trim()].filter(Boolean).join(" · ")}:t)); setNote(""); setNoteFlash(true); setTimeout(()=>setNoteFlash(false),2000); };
   const saveEdit=async(upd)=>{ await onSave(temps.map(t=>t.id===upd.id?upd:t)); setEdit(null); };
   const del=async(id)=>{ if(window.confirm("Supprimer ce relevé ?")) await onSave(temps.filter(t=>t.id!==id)); };
   const csv=()=>dlCSV(temps.map(t=>({"Date":fDate(t.ts),"Heure":fTime(t.ts),"Unité":t.unite,"Temp (°C)":t.temp,"Conforme":t.ok?"OUI":"NON","Agent":t.agent,"Note":t.note||""})),`temperatures_${new Date().toISOString().slice(0,10)}.csv`);
@@ -923,37 +1151,27 @@ function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp}){
       <R2><span style={{fontSize:28,fontWeight:900,color:"#1e293b"}}>🌡 Températures frigos</span><button className="btnS" onClick={csv}>↓ CSV</button></R2>
       <TBar opts={[{id:"saisie",label:"📝 Saisir"},{id:"hist",label:`📋 Historique (${temps.length})`}]} active={mode} onChange={setMode}/>
 
-      {mode==="saisie"&&(
+      {mode==="saisie"&&(<>
         <div className="card" style={{display:"flex",flexDirection:"column",gap:16}}>
-          <FB label="Quelle unité ?">
+          <FB label="Qui fait ce relevé ?"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
+          <FB label="Quelle unité ?" sub={`Ensuite : ${UNITES[(UNITES.findIndex(x=>x.id===uid)+1)%UNITES.length].label}`}>
             <select className="ifield" value={uid} onChange={e=>setUid(e.target.value)}>
               {UNITES.map(u=><option key={u.id} value={u.id}>{u.label} — cible : {u.type==="froid"?`${u.min} à ${u.max}°C`:`max ${u.max}°C`}</option>)}
             </select>
           </FB>
-          <FB label="Température relevée (°C)">
-            <input type="number" step="0.1" className="ifield" value={temp} onChange={e=>setTemp(e.target.value)}
+          <div>
+            <label className="fieldLabel">Température relevée (°C)</label>
+            <input type="number" inputMode="decimal" step="0.1" className="ifield" value={temp} onChange={e=>setTemp(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&submit()}
               placeholder={u.type==="froid"?"ex. 2.5":"ex. -20"}
               style={{fontSize:42,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,padding:"18px",
                 borderColor:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b",
                 color:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b"}}/>
-          </FB>
-          {ok!==null&&<ConfBanner ok={ok} detail={`Plage correcte : ${u.type==="froid"?`${u.min} à ${u.max}°C`:`max ${u.max}°C`}`} bad="→ Identifier la cause · Noter une action corrective"/>}
-          <FB label="Qui fait ce relevé ?"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
-          <FB label="Remarque (facultatif)">
-            <input className="ifield" value={note} onChange={e=>setNote(e.target.value)} placeholder="ex. porte entrouverte, livraison chaude..."/>
-          </FB>
-          <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:"10px 14px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-            <div style={{fontSize:13,color:"#94a3b8",fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>En cours</div>
-            <div style={{fontSize:16,fontWeight:900,color:"#1e293b"}}>{u.label}</div>
-            <div style={{fontSize:12,color:"#94a3b8"}}>→ {UNITES[(UNITES.findIndex(x=>x.id===uid)+1)%UNITES.length].label}</div>
+            <button className="btnP" onClick={submit} disabled={!temp}
+              style={{marginTop:10,background:flash==="ok"?"#22c55e":flash==="nc"?"#ef4444":ok===false?"#ef4444":"#f59e0b",color:flash||ok===false?"#fff":"#1e293b"}}>
+              {flash==="ok"?"✅ Enregistré → unité suivante":flash==="nc"?"🚨 Hors plage enregistré → voir en bas":ok===false?"💾 Enregistrer (hors plage)":"💾 Enregistrer et passer au suivant"}
+            </button>
           </div>
-          <button className="btnP" onClick={submit} disabled={!temp}
-            style={{background:flash==="ok"?"#22c55e":flash==="nc"?"#ef4444":"#f59e0b",color:flash?"#fff":"#1e293b"}}>
-            {flash==="ok"?"✅ Enregistré → passage au suivant":flash==="nc"?"🚨 NC enregistrée → passage au suivant":"💾 Enregistrer et passer au suivant"}
-          </button>
-          <button onClick={()=>nextUnit()} style={{background:"transparent",border:"2px solid #2d3748",borderRadius:12,color:"#94a3b8",fontFamily:"inherit",fontSize:15,fontWeight:700,padding:"12px",cursor:"pointer",width:"100%",minHeight:46}}>
-            ⏭ Passer {u.label} — non relevé aujourd'hui
-          </button>
           {tAuj.length>0&&(<>
             <div style={{fontSize:13,color:"#94a3b8",textTransform:"uppercase",letterSpacing:1.2,fontWeight:800,marginTop:4}}>Relevés d'aujourd'hui ({tAuj.length})</div>
             {tAuj.slice(-6).reverse().map(t=>(
@@ -967,7 +1185,13 @@ function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp}){
             ))}
           </>)}
         </div>
-      )}
+        <ProblemeBloc last={last} lastTxt={last&&`${last.unite} : ${last.temp>0?"+":""}${last.temp}°C à ${fTime(last.ts)}`}
+          badTxt={last&&last.ok===false?`Hors plage (${last.type==="froid"?"cible 0 à "+(UNITES.find(x=>x.id===last.uid)||{max:4}).max+"°C":"cible ≤ −18°C"}) → vérifier la porte / le joint, ressonder dans 30 min, déplacer les produits si besoin.`:null}
+          note={note} setNote={setNote} onNote={addNote} noteFlash={noteFlash} onNC={()=>onShortcut&&onShortcut("nc")}
+          extra={<button onClick={()=>nextUnit()} style={{background:"transparent",border:"2px solid #cbd5e1",borderRadius:12,color:"#64748b",fontFamily:"inherit",fontSize:15,fontWeight:700,padding:"12px",cursor:"pointer",width:"100%",minHeight:52}}>
+            ⏭ Passer {u.label} — non relevé
+          </button>}/>
+      </>)}
       {mode==="hist"&&(
         <div className="card">
           {temps.length===0?<Empty/>:temps.slice().reverse().map(t=>(
@@ -992,11 +1216,12 @@ function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp}){
   );
 }
 function EditTemps({item,onSave,onClose,agents}){
+  const UNITES=unitesLoad();
   const [uid,setUid]=useState(item.uid||UNITES[0].id);
   const [temp,setTemp]=useState(String(item.temp));
   const [agent,setAgent]=useState(item.agent);
   const [note,setNote]=useState(item.note||"");
-  const u=UNITES.find(x=>x.id===uid); const ok=temp!==""?isOK(u,temp):null;
+  const u=UNITES.find(x=>x.id===uid)||UNITES[0]; const ok=temp!==""?isOK(u,temp):null;
   return(<>
     <FB label="Unité"><select className="ifield" value={uid} onChange={e=>setUid(e.target.value)}>{UNITES.map(u=><option key={u.id} value={u.id}>{u.label}</option>)}</select></FB>
     <FB label="Température (°C)"><input type="number" step="0.1" className="ifield" value={temp} onChange={e=>setTemp(e.target.value)} style={{fontSize:34,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b"}}/></FB>
@@ -1010,7 +1235,7 @@ function EditTemps({item,onSave,onClose,agents}){
 // ══════════════════════════════════════════════
 // MODULE SERVICE CHAUD
 // ══════════════════════════════════════════════
-function ModuleService({services,onSave,agents}){
+function ModuleService({services,onSave,agents,onShortcut}){
   const [mode,setMode]=useState("saisie");
   const [poste,setPoste]=useState(POSTES_SERVICE[0]);
   const [posteLib,setPosteLib]=useState("");
@@ -1020,14 +1245,19 @@ function ModuleService({services,onSave,agents}){
   const [note,setNote]=useState("");
   const [flash,setFlash]=useState(false);
   const [edit,setEdit]=useState(null);
+  const [lastId,setLastId]=useState(null);
+  const [noteFlash,setNoteFlash]=useState(false);
   const tv=parseFloat(temp); const ok=temp!==""?(!isNaN(tv)&&tv>=63):null;
   const sAuj=services.filter(s=>sameKDay(s.ts));
   const submit=async()=>{
     if(!temp) return;
     const lib=poste==="Autre"?posteLib:poste;
-    await onSave([...services,{id:Date.now(),ts:ts(),poste:lib,plat,temp:tv,ok,agent,note}]);
-    setTemp(""); setPlat(""); setNote(""); setPosteLib(""); setFlash(true); setTimeout(()=>setFlash(false),2000);
+    const id=Date.now();
+    await onSave([...services,{id,ts:ts(),poste:lib,plat,temp:tv,ok,agent,note:""}]);
+    setTemp(""); setPlat(""); setPosteLib(""); setLastId(id); setFlash(ok===false?"nc":"ok"); setTimeout(()=>setFlash(false),2000);
   };
+  const last=lastId?services.find(x=>x.id===lastId):null;
+  const addNote=async()=>{ if(!last||!note.trim()) return; await onSave(services.map(x=>x.id===last.id?{...x,note:[x.note,note.trim()].filter(Boolean).join(" · ")}:x)); setNote(""); setNoteFlash(true); setTimeout(()=>setNoteFlash(false),2000); };
   const saveEdit=async(upd)=>{ await onSave(services.map(s=>s.id===upd.id?upd:s)); setEdit(null); };
   const del=async(id)=>{ if(window.confirm("Supprimer ce relevé ?")) await onSave(services.filter(s=>s.id!==id)); };
   const csv=()=>dlCSV(services.map(s=>({"Date":fDate(s.ts),"Heure":fTime(s.ts),"Poste":s.poste,"Plat":s.plat||"—","Temp (°C)":s.temp,"Conforme (≥63°C)":s.ok?"OUI":"NON","Agent":s.agent})),`service_chaud_${new Date().toISOString().slice(0,10)}.csv`);
@@ -1038,8 +1268,9 @@ function ModuleService({services,onSave,agents}){
         ⚖️ <b>Obligation légale :</b> plats chauds maintenus <b>≥ 63°C</b> à cœur
       </div>
       <TBar opts={[{id:"saisie",label:"📝 Saisir"},{id:"hist",label:`📋 Historique (${services.length})`}]} active={mode} onChange={setMode}/>
-      {mode==="saisie"&&(
+      {mode==="saisie"&&(<>
         <div className="card" style={{display:"flex",flexDirection:"column",gap:16}}>
+          <FB label="Qui fait ce relevé ?"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
           <FB label="Quel poste ?">
             <select className="ifield" value={poste} onChange={e=>setPoste(e.target.value)}>{POSTES_SERVICE.map(p=><option key={p} value={p}>{p}</option>)}</select>
             {poste==="Autre"&&<input className="ifield" style={{marginTop:10}} value={posteLib} onChange={e=>setPosteLib(e.target.value)} placeholder="Préciser le poste..."/>}
@@ -1047,30 +1278,33 @@ function ModuleService({services,onSave,agents}){
           <FB label="Quel plat ? (facultatif)">
             <input className="ifield" value={plat} onChange={e=>setPlat(e.target.value)} placeholder="ex. Sauce curry du jour"/>
           </FB>
-          <FB label="Température à cœur (°C)" sub="Enfoncer la sonde au centre du plat · Doit être ≥ 63°C">
-            <input type="number" step="0.5" className="ifield" value={temp} onChange={e=>setTemp(e.target.value)} placeholder="ex. 71"
+          <div>
+            <label className="fieldLabel">Température à cœur (°C)</label>
+            <div className="subLabel">Enfoncer la sonde au centre du plat · Doit être ≥ 63°C</div>
+            <input type="number" inputMode="decimal" step="0.5" className="ifield" value={temp} onChange={e=>setTemp(e.target.value)} placeholder="ex. 71"
+              onKeyDown={e=>e.key==="Enter"&&submit()}
               style={{fontSize:42,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,padding:"18px",
                 borderColor:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b",
                 color:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b"}}/>
-          </FB>
-          {ok!==null&&<ConfBanner ok={ok} detail="Seuil légal : ≥ 63°C" bad="→ Remonter en température immédiatement · Si <63°C depuis plus de 2h : retirer du service" good="→ Conforme ✓ — prochain contrôle dans 2h"/>}
-          <FB label="Qui fait ce relevé ?"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
-          <FB label="Remarque (facultatif)"><input className="ifield" value={note} onChange={e=>setNote(e.target.value)} placeholder="ex. fin de service, poste en baisse..."/></FB>
-          <button className="btnP" onClick={submit} disabled={!temp}
-            style={{background:flash?"#22c55e":"#f59e0b",color:"#1e293b"}}>
-            {flash?"✅ Relevé enregistré !":"💾 Enregistrer ce relevé"}
-          </button>
+            <button className="btnP" onClick={submit} disabled={!temp||(poste==="Autre"&&!posteLib)}
+              style={{marginTop:10,background:flash==="ok"?"#22c55e":flash==="nc"||ok===false?"#ef4444":"#f59e0b",color:flash||ok===false?"#fff":"#1e293b"}}>
+              {flash==="ok"?"✅ Relevé enregistré !":flash==="nc"?"🚨 Sous 63°C enregistré → voir en bas":ok===false?"💾 Enregistrer (sous 63°C)":"💾 Enregistrer ce relevé"}
+            </button>
+          </div>
           {sAuj.length>0&&(<>
             <div style={{fontSize:13,color:"#94a3b8",textTransform:"uppercase",letterSpacing:1.2,fontWeight:800}}>Relevés d'aujourd'hui ({sAuj.length})</div>
             {sAuj.slice(-4).reverse().map(s=>(
               <div key={s.id} className="row" style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
-                <div style={{flex:1}}><div style={{fontSize:16,fontWeight:700}}>{s.poste}{s.plat&&<span style={{color:"#64748b"}}> · {s.plat}</span>}</div><div style={{fontSize:13,color:"#94a3b8"}}>{fTime(s.ts)} · {s.agent}</div></div>
+                <div style={{flex:1}}><div style={{fontSize:16,fontWeight:700}}>{s.poste}{s.plat&&<span style={{color:"#64748b"}}> · {s.plat}</span>}</div><div style={{fontSize:13,color:"#94a3b8"}}>{fTime(s.ts)} · {s.agent}{s.note&&" · "+s.note}</div></div>
                 <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:20,fontWeight:700,color:s.ok?"#22c55e":"#ef4444"}}>{s.temp}°C</span>
               </div>
             ))}
           </>)}
         </div>
-      )}
+        <ProblemeBloc last={last} lastTxt={last&&`${last.poste}${last.plat?" · "+last.plat:""} : ${last.temp}°C à ${fTime(last.ts)}`}
+          badTxt={last&&last.ok===false?"Sous 63°C → remonter en température immédiatement (≥ 63°C à cœur). Si le plat est resté sous 63°C plus de 2 h : le retirer du service.":null}
+          note={note} setNote={setNote} onNote={addNote} noteFlash={noteFlash} onNC={()=>onShortcut&&onShortcut("nc")}/>
+      </>)}
       {mode==="hist"&&(
         <div className="card">
           {services.length===0?<Empty/>:services.slice().reverse().map(s=>(
@@ -1108,10 +1342,13 @@ function EditService({item,onSave,onClose,agents}){
 // ══════════════════════════════════════════════
 // MODULE HUILES
 // ══════════════════════════════════════════════
-function ModuleHuiles({huiles,onSave,agents}){
+function ModuleHuiles({huiles,onSave,agents,planning}){
   const [mode,setMode]=useState("saisie");
   const [frit,setFrit]=useState("Friteuse 1");
+  const [cycle,setCycleS]=useState(huileCycleLoad);
+  const setCycle=(n)=>{ setCycleS(n); huileCycleSave(n); };
   const [tpm,setTpm]=useState(""); const [col,setCol]=useState(1);
+  const [touche,setTouche]=useState(false); // l'agent a modifié la suggestion
   const [odeur,setOdeur]=useState("OK"); const [mousse,setMousse]=useState("Non");
   const [agent,setAgent]=useState((agents||AGENTS_DEFAULT)[0]);
   const [flash,setFlash]=useState(false); const [edit,setEdit]=useState(null);
@@ -1125,10 +1362,16 @@ function ModuleHuiles({huiles,onSave,agents}){
     return changes.sort((a,b)=>new Date(b.ts)-new Date(a.ts))[0];
   };
 
+  const lcF=lastChange(frit);
+  const nServ=servicesDepuis(lcF&&lcF.ts, planning||PLANNING_DEFAULT);
+  const sug=huileSuggestion(nServ, cycle);
+  // Pré-remplissage à chaque changement de friteuse / de cycle (tant que l'agent n'a rien modifié)
+  useEffect(()=>{ if(!touche){ setCol(sug.col); setOdeur("OK"); setMousse("Non"); } },[frit, sug.col, touche]);
+  const choisir=(fn)=>(v)=>{ setTouche(true); fn(v); };
   const submit=async()=>{
-    if(!tpm) return;
-    await onSave([...huiles,{id:Date.now(),ts:ts(),type:"controle",friteuse:frit,tpm:parseFloat(tpm),col,odeur,mousse,decision:d,agent}]);
-    setTpm(""); setCol(1); setOdeur("OK"); setMousse("Non");
+    const tv=parseFloat(tpm);
+    await onSave([...huiles,{id:Date.now(),ts:ts(),type:"controle",friteuse:frit,tpm:isNaN(tv)?null:tv,col,odeur,mousse,decision:d,agent,methode:isNaN(tv)?"Visuel + odeur":"TPM + visuel",services:nServ}]);
+    setTpm(""); setTouche(false);
     setFlash(true); setTimeout(()=>setFlash(false),2000);
   };
 
@@ -1139,7 +1382,7 @@ function ModuleHuiles({huiles,onSave,agents}){
 
   const saveEdit=async(upd)=>{ await onSave(huiles.map(h=>h.id===upd.id?upd:h)); setEdit(null); };
   const del=async(id)=>{ if(window.confirm("Supprimer ?")) await onSave(huiles.filter(h=>h.id!==id)); };
-  const csv=()=>dlCSV(huiles.map(h=>({"Date":fDate(h.ts),"Heure":fTime(h.ts),"Type":h.type==="changement"?"CHANGEMENT HUILE":"Contrôle","Friteuse":h.friteuse,"TPM (%)":h.type==="controle"?h.tpm:"—","Couleur":h.type==="controle"?h.col:"—","Odeur":h.type==="controle"?h.odeur:"—","Décision":h.decision,"Agent":h.agent})),`huiles_${new Date().toISOString().slice(0,10)}.csv`);
+  const csv=()=>dlCSV(huiles.map(h=>({"Date":fDate(h.ts),"Heure":fTime(h.ts),"Type":h.type==="changement"?"CHANGEMENT HUILE":"Contrôle","Friteuse":h.friteuse,"Méthode":h.type==="controle"?(h.methode||"TPM + visuel"):"—","TPM (%)":h.type==="controle"&&h.tpm!=null?h.tpm:"—","Couleur":h.type==="controle"?h.col:"—","Odeur":h.type==="controle"?h.odeur:"—","Décision":h.decision,"Agent":h.agent})),`huiles_${new Date().toISOString().slice(0,10)}.csv`);
 
   const lc=lastChange(frit);
   const controles=huiles.filter(h=>h.type!=="changement");
@@ -1147,8 +1390,8 @@ function ModuleHuiles({huiles,onSave,agents}){
   return(
     <div style={{display:"flex",flexDirection:"column",gap:16}}>
       <R2><span style={{fontSize:28,fontWeight:900,color:"#1e293b"}}>⚗ Huiles de friture</span><button className="btnS" onClick={csv}>↓ CSV</button></R2>
-      <div style={{background:"#f0f7ff",border:"1px solid #93c5fd",borderRadius:12,padding:"12px 14px",fontSize:15,color:"#1e293b",fontWeight:600}}>
-        ⚖️ Limite légale TPM : <b style={{color:"#dc2626",fontSize:17}}>25%</b> maximum
+      <div style={{background:"#f0f7ff",border:"1px solid #93c5fd",borderRadius:12,padding:"12px 14px",fontSize:15,color:"#1e293b",fontWeight:600,lineHeight:1.5}}>
+        ⚖️ Contrôle <b>visuel + odeur</b> à chaque service. Huile foncée, odeur rance/brûlée ou mousse = <b style={{color:"#dc2626"}}>changement immédiat</b> (limite légale : 25 % de composés polaires).
       </div>
       <TBar opts={[{id:"saisie",label:"📝 Contrôle"},{id:"hist",label:`📋 Historique (${controles.length})`}]} active={mode} onChange={setMode}/>
 
@@ -1174,32 +1417,48 @@ function ModuleHuiles({huiles,onSave,agents}){
           </button>
           <div style={{fontSize:12,color:"#94a3b8",textAlign:"center",marginTop:-8}}>Appuyer ici dès que vous vidangez et remplacez l'huile</div>
 
-          {/* Séparateur */}
-          <div style={{display:"flex",alignItems:"center",gap:10,margin:"4px 0"}}>
-            <div style={{flex:1,height:1,background:"#e2e8f0"}}/>
-            <div style={{fontSize:12,color:"#94a3b8",fontWeight:700,textTransform:"uppercase",letterSpacing:1}}>Contrôle TPM</div>
-            <div style={{flex:1,height:1,background:"#e2e8f0"}}/>
+          {/* Cycle de l'huile */}
+          <div className="card" style={{display:"flex",flexDirection:"column",gap:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10}}>
+              <div style={{fontSize:13,color:"#64748b",textTransform:"uppercase",letterSpacing:1.2,fontWeight:800}}>Cycle de l'huile — {frit}</div>
+              <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:16,fontWeight:700,color:sug.r>=1?"#dc2626":sug.r>=0.7?"#d97706":"#15803d"}}>{nServ==null?"—":`${nServ}/${cycle}`}</div>
+            </div>
+            <div style={{height:12,background:"#e2e8f0",borderRadius:6,overflow:"hidden"}}>
+              <div style={{height:"100%",width:`${Math.min(100,(sug.r||0)*100)}%`,background:sug.r>=1?"#ef4444":sug.r>=0.7?"#f59e0b":"#22c55e"}}/>
+            </div>
+            <div style={{fontSize:14,fontWeight:700,color:sug.r>=1?"#dc2626":sug.r>=0.7?"#92400e":"#475569"}}>{sug.txt}</div>
+            <div style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#64748b"}}>
+              Changement habituel tous les
+              <select className="ifield" value={cycle} onChange={e=>setCycle(parseInt(e.target.value))} style={{width:76,padding:"6px 8px",fontSize:15}}>
+                {[4,5,6,7,8,9,10,12,14,16].map(n=><option key={n} value={n}>{n}</option>)}
+              </select>
+              services
+            </div>
           </div>
 
           <div className="card" style={{display:"flex",flexDirection:"column",gap:16}}>
-            <FB label="TPM — Teneur en Produits Polaires (%)" sub="Mesurer avec bandelette ou testeur · Maximum légal : 25%">
-              <input type="number" step="1" min="0" max="40" className="ifield" value={tpm} onChange={e=>setTpm(e.target.value)} placeholder="ex. 14"
-                style={{fontSize:42,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,padding:"18px",
-                  borderColor:!tpm?"#e2e8f0":parseFloat(tpm)<=25?"#22c55e":"#ef4444",
-                  color:!tpm?"#1e293b":parseFloat(tpm)<=25?"#22c55e":"#ef4444"}}/>
-            </FB>
+            <div style={{background:"#fffbeb",border:"1px solid #fcd34d",borderRadius:10,padding:"10px 12px",fontSize:14,color:"#92400e",fontWeight:700,lineHeight:1.45}}>
+              👁 Pré-rempli d'après le cycle. <u>Regarde et sens l'huile</u> : si c'est pareil, enregistre ; sinon touche la bonne case.
+            </div>
+            <FB label="Qui contrôle ?"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
             <FB label="Couleur de l'huile">
               <div style={{display:"flex",gap:6}}>
-                {COULEURS.map(c=><button key={c.v} onClick={()=>setCol(c.v)} style={{flex:1,padding:"12px 2px",border:`3px solid ${col===c.v?"#f59e0b":"#e2e8f0"}`,background:c.bg,borderRadius:10,cursor:"pointer",fontSize:11,fontWeight:800,color:c.txt,textAlign:"center",lineHeight:1.4,minHeight:54}}>{c.v}<br/>{c.label}</button>)}
+                {COULEURS.map(c=><button key={c.v} onClick={()=>choisir(setCol)(c.v)} style={{flex:1,padding:"12px 2px",border:`3px solid ${col===c.v?"#f59e0b":"#e2e8f0"}`,background:c.bg,borderRadius:10,cursor:"pointer",fontSize:12,fontWeight:800,color:c.txt,textAlign:"center",lineHeight:1.4,minHeight:58}}>{c.v}<br/>{c.label}</button>)}
               </div>
             </FB>
             <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-              <FB label="Odeur"><div style={{display:"flex",flexDirection:"column",gap:8}}>{["OK","Rance","Brûlée"].map(o=><button key={o} onClick={()=>setOdeur(o)} className={`chip${odeur===o?(o==="OK"?" green":" red"):""}`}>{o}</button>)}</div></FB>
-              <FB label="Mousse excessive"><div style={{display:"flex",flexDirection:"column",gap:8}}>{["Non","Oui"].map(v=><button key={v} onClick={()=>setMousse(v)} className={`chip${mousse===v?(v==="Non"?" green":" red"):""}`}>{v}</button>)}</div></FB>
+              <FB label="Odeur"><div style={{display:"flex",flexDirection:"column",gap:8}}>{["OK","Rance","Brûlée"].map(o=><button key={o} onClick={()=>choisir(setOdeur)(o)} className={`chip${odeur===o?(o==="OK"?" green":" red"):""}`}>{o}</button>)}</div></FB>
+              <FB label="Mousse excessive"><div style={{display:"flex",flexDirection:"column",gap:8}}>{["Non","Oui"].map(v=><button key={v} onClick={()=>choisir(setMousse)(v)} className={`chip${mousse===v?(v==="Non"?" green":" red"):""}`}>{v}</button>)}</div></FB>
             </div>
-            <FB label="Agent"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
-            {d&&<DecBanner d={d}/>}
-            <button className="btnP" onClick={submit} disabled={!tpm}>{flash?"✅ Contrôle enregistré !":"💾 Enregistrer le contrôle TPM"}</button>
+            <DecBanner d={d}/>
+            <button className="btnP" onClick={submit} style={{background:flash?"#22c55e":d==="Changement immédiat"?"#ef4444":"#f59e0b",color:flash||d==="Changement immédiat"?"#fff":"#1e293b"}}>
+              {flash?"✅ Contrôle enregistré !":d==="Changement immédiat"?"💾 Enregistrer — huile à changer":"💾 Vérifié — enregistrer le contrôle"}
+            </button>
+            <details>
+              <summary style={{fontSize:14,color:"#64748b",fontWeight:700,cursor:"pointer"}}>J'ai un testeur TPM (facultatif)</summary>
+              <input type="number" inputMode="decimal" step="1" min="0" max="40" className="ifield" value={tpm} onChange={e=>setTpm(e.target.value)} placeholder="TPM en %"
+                style={{marginTop:8,fontSize:24,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:!tpm?"#e2e8f0":parseFloat(tpm)<=25?"#22c55e":"#ef4444"}}/>
+            </details>
           </div>
         </div>
       )}
@@ -1220,12 +1479,12 @@ function ModuleHuiles({huiles,onSave,agents}){
                 ):(
                   <>
                     <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-                      <span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:20,fontWeight:700,color:h.tpm<=25?"#22c55e":"#ef4444"}}>{h.tpm}%</span>
+                      {h.tpm!=null?<span style={{fontFamily:"'JetBrains Mono',monospace",fontSize:20,fontWeight:700,color:h.tpm<=25?"#22c55e":"#ef4444"}}>{h.tpm}%</span>:<span style={{fontSize:18}}>👁</span>}
                       <span style={{fontSize:15,fontWeight:700}}>{h.friteuse}</span>
                       <span style={{fontSize:12,fontWeight:800,color:DCOL[h.decision],background:DCOL_BG[h.decision],padding:"3px 8px",borderRadius:5}}>{h.decision}</span>
                     </div>
                     <div style={{fontSize:13,color:"#94a3b8"}}>{fDT(h.ts)} · {h.agent}</div>
-                    <div style={{fontSize:13,color:"#64748b"}}>Couleur {h.col}/5 · {h.odeur} · Mousse : {h.mousse}</div>
+                    <div style={{fontSize:13,color:"#64748b"}}>Couleur {h.col}/5 ({(COULEURS.find(c=>c.v===h.col)||{}).label}) · Odeur {h.odeur} · Mousse : {h.mousse}{h.services!=null&&` · ${h.services} services`}</div>
                   </>
                 )}
               </div>
@@ -1239,13 +1498,13 @@ function ModuleHuiles({huiles,onSave,agents}){
   );
 }
 function EditHuile({item,onSave,onClose,agents}){
-  const [frit,setFrit]=useState(item.friteuse); const [tpm,setTpm]=useState(String(item.tpm));
+  const [frit,setFrit]=useState(item.friteuse); const [tpm,setTpm]=useState(item.tpm!=null?String(item.tpm):"");
   const [col,setCol]=useState(item.col); const [odeur,setOdeur]=useState(item.odeur);
   const [mousse,setMousse]=useState(item.mousse); const [agent,setAgent]=useState(item.agent);
   const d=huileDecision(tpm,col,odeur,mousse);
   return(<>
     <FB label="Friteuse"><ChipR opts={["Friteuse 1","Friteuse 2"]} active={frit} onChange={setFrit}/></FB>
-    <FB label="TPM (%)"><input type="number" step="1" className="ifield" value={tpm} onChange={e=>setTpm(e.target.value)} style={{fontSize:32,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:!tpm?"#e2e8f0":parseFloat(tpm)<=25?"#22c55e":"#ef4444"}}/></FB>
+    <FB label="TPM (%) — facultatif"><input type="number" step="1" className="ifield" value={tpm} onChange={e=>setTpm(e.target.value)} style={{fontSize:32,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:!tpm?"#e2e8f0":parseFloat(tpm)<=25?"#22c55e":"#ef4444"}}/></FB>
     <FB label="Couleur"><div style={{display:"flex",gap:5}}>{COULEURS.map(c=><button key={c.v} onClick={()=>setCol(c.v)} style={{flex:1,padding:"8px 2px",border:`3px solid ${col===c.v?"#f59e0b":"#e2e8f0"}`,background:c.bg,borderRadius:9,cursor:"pointer",fontSize:10,fontWeight:800,color:c.txt,textAlign:"center",lineHeight:1.3,minHeight:48}}>{c.v}<br/>{c.label}</button>)}</div></FB>
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
       <FB label="Odeur"><div style={{display:"flex",flexDirection:"column",gap:6}}>{["OK","Rance","Brûlée"].map(o=><button key={o} onClick={()=>setOdeur(o)} className={`chip${odeur===o?(o==="OK"?" green":" red"):""}`}>{o}</button>)}</div></FB>
@@ -1253,149 +1512,489 @@ function EditHuile({item,onSave,onClose,agents}){
     </div>
     <FB label="Agent"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
     {d&&<DecBanner d={d}/>}
-    <SC onSave={()=>onSave({...item,friteuse:frit,tpm:parseFloat(tpm),col,odeur,mousse,decision:d,agent})} onClose={onClose} disabled={!tpm}/>
+    <SC onSave={()=>onSave({...item,friteuse:frit,tpm:tpm!==""?parseFloat(tpm):null,col,odeur,mousse,decision:d,agent})} onClose={onClose}/>
   </>);
 }
 
 // ══════════════════════════════════════════════
-// MODULE CELLULE
+// MODULE CELLULE — multi-cycles · lancement en 1 appui · refroidissement / surgélation
 // ══════════════════════════════════════════════
-function ModuleCellule({cellules,onSave,agents}){
-  const [mode,setMode]=useState("saisie"); const [produit,setProduit]=useState(PRODUITS_CELLULE[0]);
-  const [produitLib,setProdLib]=useState(""); const [qte,setQte]=useState(""); const [lot,setLot]=useState("");
-  const [tDepart,setTDepart]=useState(""); const [tFin,setTFin]=useState("");
-  const [agent,setAgent]=useState((agents||AGENTS_DEFAULT)[0]); const [flash,setFlash]=useState(false);
-  const [pendingId,setPending]=useState(null); const [edit,setEdit]=useState(null);
-  const calcOk=(tf,tsD,tsF)=>{ const t=parseFloat(tf); if(isNaN(t)) return null; if(!tsD||!tsF) return t<=10; return t<=10&&(new Date(tsF)-new Date(tsD))/60000<=120; };
-  const calcDuree=(tsD,tsF)=>(!tsD||!tsF)?null:Math.round((new Date(tsF)-new Date(tsD))/60000);
-  const demarrer=async()=>{
-    if(!tDepart) return;
-    const id=Date.now(); const lib=produit==="Autre"?produitLib:produit;
-    await onSave([...cellules,{id,tsDebut:ts(),tsFin:null,produit:lib,qte,lot,tDepart:parseFloat(tDepart),tFin:null,dureeMin:null,ok:null,statut:"en_cours",agent}]);
-    setPending(id); setFlash("started"); setTimeout(()=>setFlash(false),2500);
+const minDepuis = (iso, now=Date.now()) => Math.max(0, Math.floor((now - new Date(iso)) / 60000));
+const fDuree = (m) => m < 60 ? `${m} min` : `${Math.floor(m/60)}h${String(m%60).padStart(2,"0")}`;
+const cellOk = (mode, tFin, dureeMin) => {
+  const t = parseFloat(tFin); if (isNaN(t)) return null;
+  const m = CELL_MODES[mode==="surgel"?"surgel":"refroid"];
+  return t <= m.cible && (dureeMin == null || dureeMin <= m.limite);
+};
+const addDays = (iso, n) => { const d = new Date(iso); d.setDate(d.getDate() + n); return d.toISOString(); };
+
+function ModuleCellule({cellules, onPatch, agents, presets, dlcJours, onShortcut}){
+  const [mode, setMode] = useState("lancer");
+  const [agent, setAgentS] = useState(() => { const a = localStorage.getItem("bc_cell_agent"); return (agents||AGENTS_DEFAULT).includes(a) ? a : (agents||AGENTS_DEFAULT)[0]; });
+  const setAgent = (a) => { setAgentS(a); try{ localStorage.setItem("bc_cell_agent", a); }catch(e){} };
+  const [ask, setAsk] = useState(null);     // preset qui demande un nom (Plat du jour / Autre)
+  const [askName, setAskName] = useState("");
+  const [msg, setMsg] = useState(null);     // {type:"ok"|"warn"|"err", txt}
+  const [confirm5, setConfirm5] = useState(null);
+  const [edit, setEdit] = useState(null);
+  const [, tick] = useState(0);
+  const dbl = React.useRef({id: null, t: 0});
+  useEffect(() => { const i = setInterval(() => tick(x => x + 1), 15000); return () => clearInterval(i); }, []);
+
+  const enCours = cellules.filter(c => c.statut === "en_cours");
+  const modeActif = enCours.length ? (enCours[0].mode === "surgel" ? "surgel" : "refroid") : null;
+  const termines = cellules.filter(c => c.statut === "terminé");
+  const flash = (type, txt, ms=3500) => { setMsg({type, txt}); setTimeout(() => setMsg(null), ms); };
+
+  const lancer = async (p, nom, force=false) => {
+    const m = p.mode === "surgel" ? "surgel" : "refroid";
+    if (modeActif && modeActif !== m) {
+      flash("err", `Impossible : la cellule est en ${CELL_MODES[modeActif].label.toLowerCase()}. Un seul programme à la fois — clôture d'abord ${enCours.length>1?"les cycles en cours":"le cycle en cours"}.`, 6000);
+      return;
+    }
+    if (!force && enCours.length >= CELL_CAPACITE) { setConfirm5({p, nom}); return; }
+    // Anti double-appui : même produit lancé il y a moins de 2 min → il faut réappuyer dans les 8 s
+    const dernier = enCours.find(c => c.presetId === p.id && minDepuis(c.tsDebut) < 2);
+    if (!force && dernier && !p.ask && !(dbl.current.id === p.id && Date.now() - dbl.current.t < 8000)) {
+      dbl.current = {id: p.id, t: Date.now()};
+      flash("warn", `${p.label} est déjà en cellule depuis ${fTime(dernier.tsDebut)}. Pour lancer un 2e bac, appuie encore une fois.`, 8000);
+      return;
+    }
+    dbl.current = {id: null, t: 0};
+    const id = Date.now();
+    const c = { id, tsDebut: ts(), tsFin: null, produit: nom || p.label, presetId: p.id, mode: m, qte: "", lot: "",
+      tDepart: null, tFin: null, dureeMin: null, ok: null, statut: "en_cours", agent, deviceId: DEVICE_ID, vus: [] };
+    onPatch(list => [...list, c]);
+    setAsk(null); setAskName(""); setConfirm5(null);
+    flash("ok", `▶ ${CELL_MODES[m].label} lancé : ${c.produit} — alarme sur cet appareil à ${fDuree(Math.round(CELL_MODES[m].limite/2))} et ${fDuree(CELL_MODES[m].limite-15)}`);
   };
-  const cycleActifId=pendingId||(cellules.find(c=>c.statut==="en_cours")?.id||null);
-  const terminer=async()=>{
-    if(!tFin||!cycleActifId) return;
-    const now=ts();
-    await onSave(cellules.map(c=>{ if(c.id!==cycleActifId) return c; const dureeMin=calcDuree(c.tsDebut,now); return {...c,tsFin:now,tFin:parseFloat(tFin),dureeMin,ok:calcOk(tFin,c.tsDebut,now),statut:"terminé"}; }));
-    setPending(null); setTDepart(""); setTFin(""); setQte(""); setProdLib(""); setLot(""); setFlash("done"); setTimeout(()=>setFlash(false),3000);
+  const tap = (p) => {
+    if (p.ask) { setAsk(p); setAskName(""); return; }
+    lancer(p);
   };
-  const saveEdit=async(upd)=>{ await onSave(cellules.map(c=>c.id===upd.id?upd:c)); setEdit(null); };
-  const del=async(id)=>{ if(window.confirm("Supprimer ce cycle ?")) await onSave(cellules.filter(c=>c.id!==id)); };
-  const cycleEnCours=cellules.find(c=>c.statut==="en_cours");
-  const activePending=cycleActifId?cellules.find(c=>c.id===cycleActifId):null;
-  const okPreview=tFin?parseFloat(tFin)<=10:null;
-  const termines=cellules.filter(c=>c.statut==="terminé");
-  const csv=()=>dlCSV(termines.map(c=>({"Date":fDate(c.tsDebut),"Début":fTime(c.tsDebut),"Fin":c.tsFin?fTime(c.tsFin):"—","Produit":c.produit,"Qté":c.qte||"—","T° départ":c.tDepart,"T° fin":c.tFin||"—","Durée (min)":c.dureeMin||"—","Conforme":c.ok===true?"OUI":c.ok===false?"NON":"—","Agent":c.agent})),`cellule_${new Date().toISOString().slice(0,10)}.csv`);
-  return(
-    <div style={{display:"flex",flexDirection:"column",gap:16}}>
-      <R2><span style={{fontSize:28,fontWeight:900,color:"#1e293b"}}>❄ Cellule de refroidissement</span><button className="btnS" onClick={csv}>↓ CSV</button></R2>
-      <div style={{background:"#f0f7ff",border:"1px solid #93c5fd",borderRadius:12,padding:"12px 14px",fontSize:15,color:"#1e293b",lineHeight:1.7,fontWeight:600}}>
-        ⚖️ <b>Règle HACCP :</b> de <b>+63°C → ≤ +10°C</b> en moins de <b>2 heures</b>
+  const majCycle = (id, patch) => onPatch(list => list.map(c => c.id === id ? {...c, ...patch} : c));
+  const del = (id) => { if (window.confirm("Supprimer ce cycle ?")) onPatch(list => list.filter(c => c.id !== id)); };
+  const saveEdit = (upd) => { onPatch(list => list.map(c => c.id === upd.id ? upd : c)); setEdit(null); };
+
+  const csv = () => dlCSV(termines.map(c => ({"Date":fDate(c.tsDebut),"Mode":cellMode(c).label,"Début":fTime(c.tsDebut),"Fin":c.tsFin?fTime(c.tsFin):"—","Fin saisie a posteriori":c.finCorrigee?"OUI":"","Produit":c.produit+(c.precision?" — "+c.precision:""),"T° départ":c.tDepart??"—","T° fin":c.tFin??"—","Durée (min)":c.dureeMin??"—","Conforme":c.ok===true?"OUI":c.ok===false?"NON":"—","DLC":c.dlc?fDate(c.dlc):"","Agent":c.agent})), `cellule_${new Date().toISOString().slice(0,10)}.csv`);
+
+  const presetsRef = presets.filter(p => p.mode !== "surgel");
+  const presetsSurg = presets.filter(p => p.mode === "surgel");
+  const Grille = ({liste, m}) => {
+    const M = CELL_MODES[m]; const bloque = modeActif && modeActif !== m;
+    return (
+      <div style={{display:"grid", gridTemplateColumns:"repeat(3,minmax(0,1fr))", gap:8, opacity:bloque?.4:1}}>
+        {liste.map(p => (
+          <button key={p.id} onClick={() => tap(p)}
+            style={{minHeight:86, padding:"10px 6px", borderRadius:14, border:`2px solid ${M.border}`, background:M.bg, color:"#1e293b", fontFamily:"inherit", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:4}}>
+            <span style={{fontSize:30, lineHeight:1}}>{p.icon || M.icon}</span>
+            <span style={{fontSize:14, fontWeight:800, lineHeight:1.15, textAlign:"center"}}>{p.label}</span>
+          </button>
+        ))}
       </div>
-      {cycleEnCours&&(
-        <div style={{background:"#f0fdf4",border:"3px solid #22c55e",borderRadius:16,padding:16}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8,marginBottom:8}}>
-            <div style={{color:"#16a34a",fontWeight:900,fontSize:15,textTransform:"uppercase",letterSpacing:1}}>❄ Cycle en cours — Tecnodom BSF ATT05</div>
-            <button onClick={()=>del(cycleEnCours.id)} style={{background:"#fef2f2",border:"1px solid #fca5a5",borderRadius:8,color:"#dc2626",fontFamily:"inherit",fontSize:13,fontWeight:700,padding:"6px 10px",cursor:"pointer",flexShrink:0,minHeight:36}}>✕ Supprimer</button>
+    );
+  };
+
+  return (
+    <div style={{display:"flex", flexDirection:"column", gap:16}}>
+      <R2><span style={{fontSize:28, fontWeight:900, color:"#1e293b"}}>❄ Cellule</span><button className="btnS" onClick={csv}>↓ CSV</button></R2>
+
+      {msg && (
+        <div style={{position:"sticky", top:120, zIndex:50, borderRadius:12, padding:"12px 14px", fontWeight:800, fontSize:15, lineHeight:1.4,
+          background:msg.type==="ok"?"#f0fdf4":msg.type==="warn"?"#fffbeb":"#fef2f2",
+          border:`2px solid ${msg.type==="ok"?"#22c55e":msg.type==="warn"?"#f59e0b":"#ef4444"}`,
+          color:msg.type==="ok"?"#15803d":msg.type==="warn"?"#92400e":"#dc2626"}}>{msg.txt}</div>
+      )}
+
+      {/* ── CYCLES EN COURS ── */}
+      {enCours.length > 0 && (
+        <div style={{display:"flex", flexDirection:"column", gap:10}}>
+          <div style={{display:"flex", justifyContent:"space-between", alignItems:"baseline"}}>
+            <div style={{fontSize:13, color:"#64748b", textTransform:"uppercase", letterSpacing:1.2, fontWeight:800}}>En cellule — {CELL_MODES[modeActif].label}</div>
+            <div style={{fontFamily:"'JetBrains Mono',monospace", fontSize:14, fontWeight:700, color:enCours.length>CELL_CAPACITE?"#dc2626":"#64748b"}}>{enCours.length}/{CELL_CAPACITE} bacs</div>
           </div>
-          <div style={{fontSize:18,color:"#1e293b",fontWeight:700}}>{cycleEnCours.produit}{cycleEnCours.qte&&` · ${cycleEnCours.qte}`}</div>
-          <div style={{fontSize:14,color:"#94a3b8",marginTop:4}}>Démarré {fDT(cycleEnCours.tsDebut)} · T° départ : <b style={{color:"#92400e",fontSize:17}}>{cycleEnCours.tDepart}°C</b> · {cycleEnCours.agent}</div>
-          <Timer tsDebut={cycleEnCours.tsDebut}/>
-        </div>
-      )}
-      <TBar opts={[{id:"saisie",label:"▶ Nouveau cycle"},{id:"hist",label:`📋 Historique (${termines.length})`}]} active={mode} onChange={setMode}/>
-      {mode==="saisie"&&(
-        <div className="card" style={{display:"flex",flexDirection:"column",gap:16}}>
-          {!activePending?(
-            <>
-              <FB label="Quel produit ?">
-                <select className="ifield" value={produit} onChange={e=>setProduit(e.target.value)}>{PRODUITS_CELLULE.map(p=><option key={p} value={p}>{p}</option>)}</select>
-                {produit==="Autre"&&<input className="ifield" style={{marginTop:10}} value={produitLib} onChange={e=>setProdLib(e.target.value)} placeholder="Préciser..."/>}
-              </FB>
-              <FB label="Quantité (facultatif)"><input className="ifield" value={qte} onChange={e=>setQte(e.target.value)} placeholder="ex. 2 kg, 1 bac GN"/></FB>
-              <FB label="N° de lot (facultatif)" sub="Numéro sur l'emballage — à noter avant de jeter">
-                <input className="ifield" value={lot} onChange={e=>setLot(e.target.value)} placeholder="ex. L240315, FR 34.xxx"/>
-              </FB>
-              <FB label="Température à cœur au départ (°C)" sub="Enfoncer la sonde au centre du produit — doit idéalement être ≥ 63°C">
-                <input type="number" step="0.5" className="ifield" value={tDepart} onChange={e=>setTDepart(e.target.value)} placeholder="ex. 72"
-                  style={{fontSize:42,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,padding:"18px",
-                    borderColor:tDepart&&parseFloat(tDepart)>=63?"#22c55e":tDepart?"#f59e0b":"#1e293b"}}/>
-                {tDepart&&parseFloat(tDepart)<63&&<div style={{fontSize:14,color:"#92400e",marginTop:6,fontWeight:700}}>⚠ En-dessous de 63°C — noter l'heure de début si refroidissement déjà commencé</div>}
-              </FB>
-              <FB label="Agent"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
-              <button className="btnP" onClick={demarrer} disabled={!tDepart||(produit==="Autre"&&!produitLib)} style={{background:"#22c55e",color:"#f0fdf4"}}>
-                {flash==="started"?"✅ Cycle démarré !":"❄ Démarrer le cycle de refroidissement"}
-              </button>
-            </>
-          ):(
-            <>
-              <div style={{background:"#f0fdf4",border:"2px solid #22c55e",borderRadius:12,padding:"14px 16px"}}>
-                <div style={{fontSize:13,color:"#16a34a",fontWeight:800,textTransform:"uppercase",letterSpacing:.8,marginBottom:6}}>Cycle actif</div>
-                <div style={{fontWeight:700,fontSize:17}}>{activePending.produit}</div>
-                <div style={{fontSize:14,color:"#94a3b8",marginTop:4}}>Démarré : {fTime(activePending.tsDebut)} · T° départ : {activePending.tDepart}°C</div>
-                <Timer tsDebut={activePending.tsDebut}/>
-              </div>
-              <FB label="Température à cœur en fin de cycle (°C)" sub="Ressonder au centre du produit — doit être ≤ +10°C">
-                <input type="number" step="0.5" className="ifield" value={tFin} onChange={e=>setTFin(e.target.value)} placeholder="Objectif ≤ 10°C"
-                  style={{fontSize:42,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,padding:"18px",
-                    borderColor:okPreview===true?"#22c55e":okPreview===false?"#ef4444":"#1e293b"}}/>
-              </FB>
-              {tFin&&<ConfBanner ok={okPreview} detail="" bad="→ Prolonger le cycle · Si plus de 2h écoulées : ouvrir une NC" good="→ Étiqueter le bac : produit + date + DLC · Transférer au froid ou congélation"/>}
-              <div style={{display:"flex",gap:12}}>
-                <button onClick={()=>setPending(null)} style={{flex:1,padding:"14px",background:"transparent",border:"2px solid #2d3748",borderRadius:12,color:"#64748b",fontFamily:"inherit",fontSize:16,cursor:"pointer",fontWeight:700}}>← Retour</button>
-                <button className="btnP" style={{flex:2}} onClick={terminer} disabled={!tFin||!cycleActifId}>{flash==="done"?"✅ Cycle enregistré !":"💾 Clôturer le cycle"}</button>
-              </div>
-            </>
-          )}
-        </div>
-      )}
-      {mode==="hist"&&(
-        <div className="card">
-          {termines.length===0?<Empty/>:termines.slice().reverse().map(c=>(
-            <div key={c.id} className="row" style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:10}}>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{display:"flex",alignItems:"center",gap:8}}><Dot ok={c.ok}/><span style={{fontSize:15,fontWeight:700}}>{c.produit}</span>{c.qte&&<span style={{color:"#64748b",fontSize:13}}>· {c.qte}</span>}</div>
-                <div style={{fontSize:13,color:"#94a3b8"}}>{fDate(c.tsDebut)} · {fTime(c.tsDebut)}→{c.tsFin?fTime(c.tsFin):"?"} · {c.agent}</div>
-                <div style={{fontSize:13,color:"#64748b",marginTop:2}}>Départ <b style={{color:"#92400e"}}>{c.tDepart}°C</b> → Fin <b style={{color:c.ok?"#22c55e":"#ef4444"}}>{c.tFin}°C</b>{c.dureeMin!=null&&<span style={{color:c.dureeMin<=120?"#22c55e":"#ef4444"}}> · {c.dureeMin}min{c.dureeMin>120&&" ⚠ >2h"}</span>}</div>
-              </div>
-              <ABtns onEdit={()=>setEdit(c)} onDel={()=>del(c.id)}/>
-            </div>
+          {enCours.slice().sort((a,b)=>new Date(a.tsDebut)-new Date(b.tsDebut)).map(c => (
+            <CycleCard key={c.id} c={c} dlcJours={dlcJours} onUpdate={patch => majCycle(c.id, patch)} onDel={() => del(c.id)} onShortcut={onShortcut}/>
           ))}
         </div>
       )}
-      {edit&&<Modal title="✏️ Modifier cycle cellule" onClose={()=>setEdit(null)}><EditCellule item={edit} agents={agents} onSave={saveEdit} onClose={()=>setEdit(null)}/></Modal>}
+
+      <TBar opts={[{id:"lancer", label:"▶ Lancer"}, {id:"hist", label:`📋 Historique (${termines.length})`}]} active={mode} onChange={setMode}/>
+
+      {mode === "lancer" && (
+        <div className="card" style={{display:"flex", flexDirection:"column", gap:16}}>
+          <FB label="Qui lance ?"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
+          <div>
+            <label className="fieldLabel" style={{color:"#0369a1"}}>❄ Refroidissement</label>
+            <div className="subLabel"><b>+63°C → ≤ +10°C en 2 h.</b> Un appui = le cycle démarre. Alarmes à 1 h et 1 h 45.</div>
+            <Grille liste={presetsRef} m="refroid"/>
+          </div>
+          <div>
+            <label className="fieldLabel" style={{color:"#6d28d9"}}>🧊 Surgélation</label>
+            <div className="subLabel"><b>→ ≤ −18°C à cœur, 4 h 30 max.</b> Alarmes à 2 h 15 et 4 h 15. Jamais en même temps qu'un refroidissement.</div>
+            <Grille liste={presetsSurg} m="surgel"/>
+          </div>
+          <div style={{fontSize:13, color:"#94a3b8", lineHeight:1.5}}>Liste modifiable dans ⚙ Réglages › Cellule.</div>
+        </div>
+      )}
+
+      {mode === "hist" && (
+        <div className="card">
+          {termines.length === 0 ? <Empty/> : termines.slice().reverse().map(c => {
+            const M = cellMode(c);
+            return (
+              <div key={c.id} className="row" style={{display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10}}>
+                <div style={{flex:1, minWidth:0}}>
+                  <div style={{display:"flex", alignItems:"center", gap:8, flexWrap:"wrap"}}><Dot ok={c.ok}/><span style={{fontSize:15, fontWeight:700}}>{c.produit}{c.precision&&` — ${c.precision}`}</span><span style={{fontSize:12, fontWeight:800, color:M.color}}>{M.icon} {M.short}</span></div>
+                  <div style={{fontSize:13, color:"#94a3b8"}}>{fDate(c.tsDebut)} · {fTime(c.tsDebut)}→{c.tsFin?fTime(c.tsFin):"?"}{c.finCorrigee&&" (saisie a posteriori)"} · {c.agent}</div>
+                  <div style={{fontSize:13, color:"#64748b", marginTop:2}}>Départ <b style={{color:"#92400e"}}>{c.tDepart!=null?`${c.tDepart}°C`:"—"}</b> → Fin <b style={{color:c.ok?"#22c55e":"#ef4444"}}>{c.tFin}°C</b>{c.dureeMin!=null&&<span style={{color:c.dureeMin<=M.limite?"#22c55e":"#ef4444"}}> · {fDuree(c.dureeMin)}{c.dureeMin>M.limite&&" ⚠ dépassé"}</span>}</div>
+                  {c.dlc && <div style={{fontSize:13, color:"#6d28d9", marginTop:2, fontWeight:700}}>À consommer avant le {fDate(c.dlc)}</div>}
+                </div>
+                <ABtns onEdit={() => setEdit(c)} onDel={() => del(c.id)}/>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {ask && (
+        <Modal title={`${ask.icon} ${ask.label} — ${CELL_MODES[ask.mode==="surgel"?"surgel":"refroid"].label}`} onClose={() => setAsk(null)}>
+          <FB label="Nom du produit"><input className="ifield" autoFocus value={askName} onChange={e => setAskName(e.target.value)} onKeyDown={e => e.key==="Enter" && askName.trim() && lancer(ask, askName.trim())} placeholder="ex. Blanquette de veau"/></FB>
+          <button className="btnP" disabled={!askName.trim()} onClick={() => lancer(ask, askName.trim())}>▶ Lancer le cycle</button>
+        </Modal>
+      )}
+      {confirm5 && (
+        <Modal title="⚠ Cellule pleine ?" onClose={() => setConfirm5(null)}>
+          <div style={{fontSize:16, color:"#1e293b", lineHeight:1.5}}>Il y a déjà <b>{enCours.length} bacs</b> en cours. La Tecnodom a <b>{CELL_CAPACITE} niveaux GN1/1</b> : au-delà, l'air circule mal et les produits refroidissent moins vite.</div>
+          <div style={{display:"flex", gap:12}}>
+            <button onClick={() => setConfirm5(null)} style={{flex:1, padding:14, background:"transparent", border:"2px solid #cbd5e1", borderRadius:12, color:"#64748b", fontFamily:"inherit", fontSize:16, fontWeight:700, cursor:"pointer", minHeight:52}}>Annuler</button>
+            <button className="btnP" style={{flex:2}} onClick={() => lancer(confirm5.p, confirm5.nom, true)}>Lancer quand même</button>
+          </div>
+        </Modal>
+      )}
+      {edit && <Modal title="✏️ Modifier cycle cellule" onClose={() => setEdit(null)}><EditCellule item={edit} agents={agents} onSave={saveEdit} onClose={() => setEdit(null)}/></Modal>}
     </div>
   );
 }
+
+// Carte d'un cycle en cours : minuteur, T° départ facultative, clôture juste sous la saisie
+function CycleCard({c, dlcJours, onUpdate, onDel, onShortcut}){
+  const M = cellMode(c);
+  const [tFin, setTFin] = useState("");
+  const [tDep, setTDep] = useState(c.tDepart != null ? String(c.tDepart) : "");
+  const [heureSortie, setHeureSortie] = useState("");
+  const [prec, setPrec] = useState(c.precision || "");
+  const [done, setDone] = useState(null);
+  const el = minDepuis(c.tsDebut);
+  const enRetard = el > M.limite + 15;   // cycle oublié : on demande l'heure réelle de sortie
+  const ici = c.deviceId === DEVICE_ID;
+
+  // Heure de sortie réelle (cycle oublié) → date complète entre le début et maintenant
+  const finReelle = () => {
+    if (!enRetard || !heureSortie) return { iso: ts(), corr: false };
+    const [hh, mm] = heureSortie.split(":").map(Number);
+    const deb = new Date(c.tsDebut); const d = new Date(deb); d.setHours(hh, mm, 0, 0);
+    if (d < deb) d.setDate(d.getDate() + 1);
+    if (d > new Date()) return { iso: null, corr: true };
+    return { iso: d.toISOString(), corr: true };
+  };
+  const fr = finReelle();
+  const dureeFin = fr.iso ? Math.round((new Date(fr.iso) - new Date(c.tsDebut)) / 60000) : null;
+  const okPreview = tFin !== "" ? cellOk(c.mode, tFin, dureeFin) : null;
+
+  const cloturer = async () => {
+    if (tFin === "" || !fr.iso) return;
+    const dureeMin = dureeFin;
+    const ok = cellOk(c.mode, tFin, dureeMin);
+    const patch = { tsFin: fr.iso, tFin: parseFloat(tFin), dureeMin, ok, statut: "terminé", finCorrigee: fr.corr || undefined,
+      tDepart: tDep !== "" ? parseFloat(tDep) : c.tDepart };
+    if (c.mode === "surgel") patch.dlc = addDays(fr.iso, dlcJours);
+    setDone({ ok, dlc: patch.dlc, tsFin: fr.iso });
+    setTimeout(() => onUpdate(patch), 2600);
+  };
+
+  if (done) return (
+    <div style={{background:done.ok?"#f0fdf4":"#fef2f2", border:`3px solid ${done.ok?"#22c55e":"#ef4444"}`, borderRadius:16, padding:16}}>
+      <div style={{fontSize:18, fontWeight:900, color:done.ok?"#15803d":"#dc2626"}}>{done.ok ? "✅ Cycle conforme — enregistré" : "🚨 Cycle NON conforme — enregistré"}</div>
+      <div style={{fontSize:15, color:"#1e293b", marginTop:6, fontWeight:700}}>Étiquette : {c.precision||c.produit} · {M.label.toLowerCase()} le {fDate(done.tsFin)}{done.dlc ? ` · à consommer avant le ${fDate(done.dlc)}` : ""}</div>
+      {!done.ok && <button className="btnS" style={{marginTop:10}} onClick={() => onShortcut && onShortcut("nc")}>⚠ Ouvrir une fiche Problème</button>}
+    </div>
+  );
+
+  const pct = Math.min(100, el / M.limite * 100);
+  const col = el > M.limite ? "#ef4444" : el >= M.limite - 15 ? "#f59e0b" : M.color;
+  return (
+    <div style={{background:"#ffffff", border:`3px solid ${el > M.limite ? "#ef4444" : M.border}`, borderRadius:16, padding:14, display:"flex", flexDirection:"column", gap:10}}>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:8}}>
+        <div style={{minWidth:0}}>
+          <div style={{fontSize:19, fontWeight:900, color:"#1e293b", lineHeight:1.2}}>{c.produit}{c.precision&&<span style={{fontWeight:700, color:"#475569"}}> — {c.precision}</span>}</div>
+          <div style={{fontSize:13, color:"#64748b", marginTop:2}}>{M.icon} {M.label} · lancé à {fTime(c.tsDebut)}{new Date(c.tsDebut).toDateString()!==new Date().toDateString()&&` le ${fDate(c.tsDebut)}`} · {c.agent}</div>
+          <div style={{fontSize:12, color:ici?"#15803d":"#94a3b8", fontWeight:700, marginTop:2}}>{ici ? "🔔 Alarmes sur cet appareil" : "🔕 Alarmes sur l'appareil qui l'a lancé"}</div>
+        </div>
+        <button onClick={onDel} style={{background:"#fff", border:"1.5px solid #fecaca", borderRadius:9, color:"#ef4444", fontFamily:"inherit", fontSize:14, fontWeight:700, padding:"8px 10px", cursor:"pointer", minHeight:40, flexShrink:0}}>✕</button>
+      </div>
+      {/* Minuteur avec repères mi-parcours / fin */}
+      <div style={{display:"flex", alignItems:"center", gap:10}}>
+        <div style={{fontFamily:"'JetBrains Mono',monospace", fontSize:26, fontWeight:700, color:col, minWidth:86}}>{fDuree(el)}</div>
+        <div style={{flex:1, position:"relative", height:14, background:"#e2e8f0", borderRadius:7, overflow:"hidden"}}>
+          <div style={{height:"100%", background:col, width:`${pct}%`, transition:"width .5s"}}/>
+          <div style={{position:"absolute", left:"50%", top:0, bottom:0, width:2, background:"#fff"}}/>
+          <div style={{position:"absolute", left:`${(M.limite-15)/M.limite*100}%`, top:0, bottom:0, width:2, background:"#fff"}}/>
+        </div>
+        <div style={{fontSize:13, color:"#94a3b8", fontWeight:700}}>/ {fDuree(M.limite)}</div>
+      </div>
+      {el > M.limite && <div style={{fontSize:14, color:"#dc2626", fontWeight:900}}>⚠ Temps dépassé de {fDuree(el - M.limite)} — sonder maintenant</div>}
+
+      <FB label={`T° à cœur à la sortie · cible ${M.cibleTxt}`}>
+        <input type="number" inputMode="decimal" step="0.5" className="ifield" value={tFin} onChange={e => setTFin(e.target.value)} placeholder={c.mode==="surgel"?"ex. -19":"ex. 6"}
+          style={{fontSize:42, fontFamily:"'JetBrains Mono',monospace", textAlign:"center", fontWeight:700, padding:"8px",
+            borderColor:okPreview===true?"#22c55e":okPreview===false?"#ef4444":"#cbd5e1", color:okPreview===true?"#15803d":okPreview===false?"#dc2626":"#1e293b"}}/>
+      </FB>
+      {enRetard && (
+        <FB label="Heure réelle de sortie" sub={`Le cycle tourne depuis ${fDuree(el)} : si le produit est sorti plus tôt, indique l'heure (sinon laisse vide = maintenant).`}>
+          <input type="time" className="ifield" value={heureSortie} onChange={e => setHeureSortie(e.target.value)} style={{fontSize:22, textAlign:"center"}}/>
+          {heureSortie && !fr.iso && <div style={{fontSize:14, color:"#dc2626", fontWeight:700, marginTop:6}}>Heure dans le futur — vérifier.</div>}
+        </FB>
+      )}
+      <button className="btnP" onClick={cloturer} disabled={tFin === "" || !fr.iso}
+        style={{background:okPreview===false?"#ef4444":okPreview===true?"#22c55e":"#f59e0b", color:okPreview===null?"#1e293b":"#fff"}}>
+        {okPreview===false ? "💾 Clôturer — NON conforme" : "💾 Clôturer le cycle"}
+      </button>
+      <details>
+        <summary style={{fontSize:14, color:"#64748b", fontWeight:700, cursor:"pointer", padding:"4px 0"}}>Préciser le produit · T° de départ (facultatif)</summary>
+        <div style={{display:"flex", gap:8, marginTop:8}}>
+          <input className="ifield" value={prec} onChange={e => setPrec(e.target.value)} placeholder="ex. effiloché El Pastor" style={{fontSize:16}}/>
+          <button className="btnS" disabled={prec.trim()===(c.precision||"")} onClick={() => onUpdate({precision: prec.trim()})}>OK</button>
+        </div>
+        <div style={{display:"flex", gap:8, marginTop:8}}>
+          <input type="number" inputMode="decimal" step="0.5" className="ifield" value={tDep} onChange={e => setTDep(e.target.value)} placeholder="ex. 72" style={{fontSize:20, textAlign:"center", fontFamily:"'JetBrains Mono',monospace"}}/>
+          <button className="btnS" disabled={tDep===""} onClick={() => onUpdate({tDepart: parseFloat(tDep)})}>OK</button>
+        </div>
+        {c.tDepart != null && <div style={{fontSize:13, color:"#92400e", marginTop:6, fontWeight:700}}>Enregistrée : {c.tDepart}°C{c.tDepart<63&&c.mode!=="surgel"&&" (sous 63°C : le refroidissement avait déjà commencé)"}</div>}
+      </details>
+    </div>
+  );
+}
+
 function EditCellule({item,onSave,onClose,agents}){
-  const [produit,setProduit]=useState(item.produit); const [qte,setQte]=useState(item.qte||"");
-  const [tDepart,setTDepart]=useState(String(item.tDepart)); const [tFin,setTFin]=useState(item.tFin!=null?String(item.tFin):"");
+  const M = cellMode(item);
+  const [produit,setProduit]=useState(item.produit);
+  const [tDepart,setTDepart]=useState(item.tDepart!=null?String(item.tDepart):""); const [tFin,setTFin]=useState(item.tFin!=null?String(item.tFin):"");
   const [agent,setAgent]=useState(item.agent);
   const dureeMin=item.tsDebut&&item.tsFin?Math.round((new Date(item.tsFin)-new Date(item.tsDebut))/60000):item.dureeMin;
-  const tFinV=parseFloat(tFin); const ok=tFin?(tFinV<=10&&(dureeMin??0)<=120):null;
+  const ok=tFin!==""?cellOk(item.mode,tFin,dureeMin):null;
   return(<>
+    <div style={{fontSize:14,fontWeight:800,color:M.color}}>{M.icon} {M.label} · cible {M.cibleTxt} en {fDuree(M.limite)} max</div>
     <FB label="Produit"><input className="ifield" value={produit} onChange={e=>setProduit(e.target.value)}/></FB>
-    <FB label="Quantité"><input className="ifield" value={qte} onChange={e=>setQte(e.target.value)}/></FB>
     <FB label="T° départ (°C)"><input type="number" step="0.5" className="ifield" value={tDepart} onChange={e=>setTDepart(e.target.value)} style={{fontSize:28,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700}}/></FB>
     <FB label="T° fin (°C)"><input type="number" step="0.5" className="ifield" value={tFin} onChange={e=>setTFin(e.target.value)} style={{fontSize:28,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:ok===true?"#22c55e":ok===false?"#ef4444":"#e2e8f0"}}/></FB>
-    {dureeMin!=null&&<div style={{fontSize:14,color:"#94a3b8",fontWeight:700}}>Durée calculée : <b style={{color:dureeMin<=120?"#22c55e":"#ef4444"}}>{dureeMin} minutes</b></div>}
+    {dureeMin!=null&&<div style={{fontSize:14,color:"#94a3b8",fontWeight:700}}>Durée calculée : <b style={{color:dureeMin<=M.limite?"#22c55e":"#ef4444"}}>{fDuree(dureeMin)}</b></div>}
     {ok!==null&&<SmConf ok={ok}/>}
     <FB label="Agent"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
-    <SC onSave={()=>onSave({...item,produit,qte,tDepart:parseFloat(tDepart),tFin:tFin?tFinV:item.tFin,dureeMin,ok:tFin?ok:item.ok,agent})} onClose={onClose}/>
+    <SC onSave={()=>onSave({...item,produit,tDepart:tDepart!==""?parseFloat(tDepart):null,tFin:tFin!==""?parseFloat(tFin):item.tFin,dureeMin,ok:tFin!==""?ok:item.ok,agent})} onClose={onClose}/>
   </>);
 }
-function Timer({tsDebut}){
-  const [elapsed,setElapsed]=useState(0);
-  useEffect(()=>{ const c=()=>setElapsed(Math.floor((Date.now()-new Date(tsDebut))/60000)); c(); const i=setInterval(c,15000); return()=>clearInterval(i); },[tsDebut]);
-  const over=elapsed>120; const warn=elapsed>=90;
-  return(
-    <div style={{marginTop:10,display:"flex",alignItems:"center",gap:10}}>
-      <div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:26,fontWeight:700,color:over?"#ef4444":warn?"#f59e0b":"#22c55e"}}>{elapsed}min</div>
-      <div style={{flex:1,height:12,background:"#1e293b",borderRadius:6,overflow:"hidden"}}><div style={{height:"100%",borderRadius:6,background:over?"#ef4444":warn?"#f59e0b":"#22c55e",width:`${Math.min(100,elapsed/120*100)}%`,transition:"width .5s"}}/></div>
-      <div style={{fontSize:13,color:"#94a3b8",fontWeight:700}}>/ 120min</div>
-      {over&&<div style={{fontSize:13,color:"#dc2626",fontWeight:900}}>⚠ DÉPASSÉ</div>}
+
+// ══════════════════════════════════════════════
+// ALARMES — bandeau + moteur
+// ══════════════════════════════════════════════
+function AlarmBanner({alarms, onAck, onSnooze, onGo}){
+  if (!alarms.length) return null;
+  const a = alarms[0];
+  const urgent = a.niveau === "urgent";
+  return (
+    <div style={{position:"sticky", top:120, zIndex:150, margin:"0 0 14px", background:urgent?"#dc2626":"#f59e0b", color:urgent?"#fff":"#1e293b", borderRadius:16, padding:"14px 14px 12px", boxShadow:"0 6px 24px rgba(0,0,0,.25)"}}>
+      <div style={{display:"flex", gap:10, alignItems:"flex-start"}}>
+        <span className="pulseR" style={{fontSize:30, lineHeight:1}}>🔔</span>
+        <div style={{flex:1, minWidth:0}}>
+          <div style={{fontSize:19, fontWeight:900, lineHeight:1.2}}>{a.titre}</div>
+          <div style={{fontSize:15, fontWeight:700, marginTop:3, lineHeight:1.35}}>{a.txt}</div>
+          <div style={{fontSize:12, fontWeight:800, marginTop:4, opacity:.85}}>🔊 Sonne jusqu'à ce que tu appuies sur un bouton</div>
+          {alarms.length > 1 && <div style={{fontSize:13, fontWeight:800, marginTop:4, opacity:.85}}>+ {alarms.length-1} autre{alarms.length>2?"s":""} alarme{alarms.length>2?"s":""}</div>}
+        </div>
+      </div>
+      <div style={{display:"flex", gap:8, marginTop:12}}>
+        <button onClick={() => onGo(a)} style={{flex:2, minHeight:52, borderRadius:12, border:"none", background:"#fff", color:"#1e293b", fontFamily:"inherit", fontSize:16, fontWeight:900, cursor:"pointer"}}>{a.cta || "Voir"}</button>
+        {a.snooze && <button onClick={() => onSnooze(a)} style={{flex:1, minHeight:52, borderRadius:12, border:"2px solid rgba(255,255,255,.7)", background:"transparent", color:"inherit", fontFamily:"inherit", fontSize:15, fontWeight:800, cursor:"pointer"}}>+30 min</button>}
+        <button onClick={() => onAck(a)} style={{flex:1, minHeight:52, borderRadius:12, border:"2px solid rgba(255,255,255,.7)", background:"transparent", color:"inherit", fontFamily:"inherit", fontSize:15, fontWeight:800, cursor:"pointer"}}>OK</button>
+      </div>
+    </div>
+  );
+}
+
+// Calcule les alarmes dues à l'instant t (pure, testable)
+const calcAlarmes = ({cellules, temps, nettoyages, cfg, planning, acks, now=new Date()}) => {
+  const out = [];
+  if (!cfg.on) return out;
+  // Cellule : seulement les cycles lancés depuis CET appareil
+  if (cfg.cellule) {
+    cellules.filter(c => c.statut === "en_cours" && c.deviceId === DEVICE_ID).forEach(c => {
+      const M = cellMode(c); const el = minDepuis(c.tsDebut, now.getTime());
+      const j = cellJalons(M).filter(j => el >= j.at).pop();
+      if (!j) return;
+      const key = `c_${c.id}_${j.k}`;
+      if ((c.vus || []).includes(j.k) || acks[key]) return;
+      out.push({ key, cycleId: c.id, jalon: j.k, tab: "cellule", niveau: j.k === "over" ? "urgent" : "rappel",
+        titre: `${M.icon} ${c.produit} — ${j.titre}`, txt: `${fDuree(el)} en cellule · ${j.txt} (cible ${M.cibleTxt})`, cta: "Aller à la cellule" });
+    });
+  }
+  const jour = kitchenDay(now);
+  const hn = hDec(now);
+  const okPlanning = (h) => !cfg.horaires || enService(planning, now) || hn - h < 1.5; // tolérance juste après un créneau
+  const snoozed = (k) => acks[k] && acks[k] > now.getTime();
+  const acked = (k) => acks[k] === true;
+  if (cfg.temps) {
+    const nAuj = temps.filter(t => sameKDay(t.ts)).length;
+    // seul le dernier créneau échu compte (pas de « relevé du midi » affiché le soir)
+    creneauxTemps(planning, now).filter(cr => hn >= cr.h).slice(-1).forEach(cr => {
+      const key = `${jour}_${cr.id}`;
+      if (hn >= cr.h && nAuj < cr.need && okPlanning(cr.h) && !acked(key) && !snoozed(key))
+        out.push({ key, tab: "temps", niveau: "rappel", snooze: true, titre: `🌡 ${cr.label} à faire`, txt: `Prévu à ${fH(cr.h)} · ${nAuj} relevé${nAuj>1?"s":""} aujourd'hui — minimum 2 par jour.`, cta: "Faire le relevé" });
+    });
+  }
+  if (cfg.menage) {
+    const pndJour = (pndLoad() || PND_DEFAULT).filter(p => p.freq === "Journalier");
+    const fait = pndJour.filter(p => nettoyages.some(n => sameKDay(n.ts) && n.tacheId === p.id)).length;
+    creneauxMenage(planning, now).forEach(cr => {
+      const key = `${jour}_${cr.id}`;
+      if (hn >= cr.h && fait < pndJour.length && okPlanning(cr.h) && !acked(key) && !snoozed(key))
+        out.push({ key, tab: "nettoyage", niveau: "rappel", snooze: true, titre: `🧹 ${cr.label}`, txt: `${pndJour.length - fait} tâche${pndJour.length-fait>1?"s":""} du jour pas encore validée${pndJour.length-fait>1?"s":""}.`, cta: "Valider le ménage" });
+    });
+  }
+  return out.sort((a,b)=>(b.niveau==="urgent")-(a.niveau==="urgent"));
+};
+
+// ══════════════════════════════════════════════
+// RÉGLAGES — ALARMES & PLANNING
+// ══════════════════════════════════════════════
+function Toggle({on, onChange, label, sub, disabled}){
+  return (
+    <button onClick={() => !disabled && onChange(!on)} style={{display:"flex", alignItems:"center", gap:12, width:"100%", background:"transparent", border:"none", padding:"10px 0", cursor:disabled?"default":"pointer", fontFamily:"inherit", textAlign:"left", opacity:disabled?.45:1}}>
+      <div style={{flex:1}}>
+        <div style={{fontSize:17, fontWeight:800, color:"#1e293b"}}>{label}</div>
+        {sub && <div style={{fontSize:13, color:"#64748b", marginTop:2, lineHeight:1.4}}>{sub}</div>}
+      </div>
+      <div style={{width:58, height:34, borderRadius:17, background:on?"#22c55e":"#cbd5e1", position:"relative", flexShrink:0, transition:"background .15s"}}>
+        <div style={{position:"absolute", top:3, left:on?27:3, width:28, height:28, borderRadius:"50%", background:"#fff", boxShadow:"0 1px 4px rgba(0,0,0,.25)", transition:"left .15s"}}/>
+      </div>
+    </button>
+  );
+}
+
+function SettingsAlarmes({cfg, onCfg, planning, onPlanning}){
+  const set = (k, v) => onCfg({...cfg, [k]: v});
+  const perm = ("Notification" in window) ? Notification.permission : "indispo";
+  const [p, setP] = useState(planning);
+  useEffect(() => setP(planning), [planning]);
+  const [flash, setFlash] = useState("");
+  const toggleJour = (d, k) => { const np = {...p, jours: {...p.jours, [d]: {...(p.jours[d]||{}), [k]: !(p.jours[d]||{})[k]}}}; setP(np); onPlanning(np); };
+  const setHeure = (svc, k, v) => { const n = parseFloat(v); if (isNaN(n)) return; const np = {...p, [svc]: {...p[svc], [k]: n}}; setP(np); onPlanning(np); };
+  const hours = Array.from({length:37}, (_, i) => 6 + i * 0.5).filter(h => h <= 24);
+  const off = !cfg.on;
+  return (
+    <div style={{display:"flex", flexDirection:"column", gap:14}}>
+      <div className="card" style={{display:"flex", flexDirection:"column", gap:2}}>
+        <div style={{fontSize:13, color:"#64748b", textTransform:"uppercase", letterSpacing:1.2, fontWeight:800, marginBottom:4}}>Sur cet appareil</div>
+        <Toggle on={cfg.on} onChange={v => set("on", v)} label="🔔 Alarmes sonores" sub="Coupé = aucun son ni notification sur ce téléphone / cette tablette. Les autres appareils ne changent pas."/>
+        <div style={{height:1, background:"#e2e8f0", margin:"4px 0"}}/>
+        <Toggle disabled={off} on={cfg.cellule} onChange={v => set("cellule", v)} label="❄ Cellule" sub="Mi-parcours, 15 min avant la fin, dépassement — uniquement pour les cycles lancés depuis cet appareil. Sonne en boucle jusqu'à intervention."/>
+        <Toggle disabled={off} on={cfg.temps} onChange={v => set("temps", v)} label="🌡 Relevés T° frigos" sub="30 min après le début de chaque service si le relevé manque."/>
+        <Toggle disabled={off} on={cfg.menage} onChange={v => set("menage", v)} label="🧹 Ménage de clôture" sub="45 min avant la fin du dernier service si des tâches du jour manquent."/>
+        <Toggle disabled={off} on={cfg.horaires} onChange={v => set("horaires", v)} label="📅 Respecter le planning" sub="Rappels relevés et ménage seulement les jours cochés, et plus de son après la fin du service."/>
+        <Toggle on={cfg.wake} onChange={v => set("wake", v)} label="💡 Écran toujours allumé" sub="Pour la tablette de cuisine : l'écran ne se met pas en veille tant que l'app est ouverte."/>
+        <div style={{display:"flex", gap:8, marginTop:8, flexWrap:"wrap"}}>
+          <button className="btnS" style={{flex:1}} onClick={() => { unlockSons(); setTimeout(() => playSon("rappel"), 150); setFlash("🔊 Sonnerie de rappel (en vrai, elle tourne en boucle jusqu'à ce que tu appuies)"); setTimeout(() => setFlash(""), 2500); }}>🔊 Tester le son</button>
+          {perm === "default" && <button className="btnS" style={{flex:1}} onClick={() => Notification.requestPermission().then(() => setFlash("✓ Réponse enregistrée"))}>Autoriser les notifications</button>}
+        </div>
+        {flash && <div style={{fontSize:14, color:"#15803d", fontWeight:800, marginTop:6}}>{flash}</div>}
+        <div style={{fontSize:13, color:"#94a3b8", lineHeight:1.5, marginTop:8}}>⚠ Les alarmes sonnent uniquement quand l'app est ouverte à l'écran (téléphone verrouillé = pas de son). Monter le volume du téléphone au maximum.</div>
+      </div>
+
+      <div className="card" style={{display:"flex", flexDirection:"column", gap:12}}>
+        <div>
+          <div style={{fontSize:13, color:"#64748b", textTransform:"uppercase", letterSpacing:1.2, fontWeight:800}}>📅 Planning de la cuisine</div>
+          <div style={{fontSize:13, color:"#94a3b8", marginTop:4, lineHeight:1.4}}>Partagé avec tous les appareils. À modifier seulement quand le planning change (saison, fermeture…).</div>
+        </div>
+        <div style={{display:"grid", gridTemplateColumns:"1fr 84px 84px", gap:8, alignItems:"center"}}>
+          <div/><div style={{fontSize:13, fontWeight:800, color:"#64748b", textAlign:"center"}}>MIDI</div><div style={{fontSize:13, fontWeight:800, color:"#64748b", textAlign:"center"}}>SOIR</div>
+          {JOURS.map(([d, nom]) => (
+            <React.Fragment key={d}>
+              <div style={{fontSize:17, fontWeight:800, color:"#1e293b"}}>{nom}</div>
+              {["midi", "soir"].map(k => { const on = !!(p.jours[d] || {})[k]; return (
+                <button key={k} onClick={() => toggleJour(d, k)} className={`chip${on ? " green" : ""}`} style={{minHeight:48, padding:"8px 4px", fontSize:20}}>{on ? "✓" : "—"}</button>
+              ); })}
+            </React.Fragment>
+          ))}
+        </div>
+        {["midi", "soir"].map(svc => (
+          <div key={svc} style={{display:"grid", gridTemplateColumns:"80px 1fr 1fr", gap:8, alignItems:"center"}}>
+            <div style={{fontSize:15, fontWeight:800, color:"#1e293b"}}>{svc === "midi" ? "Midi" : "Soir"}</div>
+            {["debut", "fin"].map(k => (
+              <select key={k} className="ifield" value={p[svc][k]} onChange={e => setHeure(svc, k, e.target.value)} style={{padding:"10px 8px", fontSize:16}}>
+                {hours.map(h => <option key={h} value={h}>{k === "debut" ? "de " : "à "}{fH(h)}</option>)}
+              </select>
+            ))}
+          </div>
+        ))}
+        <TodayPreview planning={p}/>
+      </div>
+    </div>
+  );
+}
+function TodayPreview({planning}){
+  const sv = servicesDuJour(planning);
+  const ct = creneauxTemps(planning), cm = creneauxMenage(planning);
+  return (
+    <div style={{background:"#f8fafc", border:"1px solid #e2e8f0", borderRadius:10, padding:"10px 12px", fontSize:14, color:"#475569", lineHeight:1.6}}>
+      <b>Aujourd'hui :</b> {sv.length ? sv.map(s => `${s.k} ${fH(s.debut)}–${fH(s.fin)}`).join(" + ") : "repos — aucun rappel"}
+      {sv.length > 0 && <><br/>Rappels : {[...ct.map(c => `🌡 ${fH(c.h)}`), ...cm.map(c => `🧹 ${fH(c.h)}`)].join(" · ")}</>}
+    </div>
+  );
+}
+
+function SettingsCellule({presets, onSave, dlcJours, onDlc}){
+  const [icon, setIcon] = useState(""); const [label, setLabel] = useState(""); const [mode, setMode] = useState("refroid"); const [ask, setAsk] = useState(false);
+  const [flash, setFlash] = useState("");
+  const [dlc, setDlc] = useState(String(dlcJours));
+  const add = () => { const l = label.trim(); if (!l) return; onSave([...presets, {id: "p_" + Date.now(), icon: icon.trim() || CELL_MODES[mode].icon, label: l, mode, ask: ask || undefined}]); setLabel(""); setIcon(""); setAsk(false); setFlash("✓ Ajouté !"); setTimeout(() => setFlash(""), 2000); };
+  const rm = (id) => { if (window.confirm("Retirer ce bouton ?")) onSave(presets.filter(p => p.id !== id)); };
+  const move = (id, dir) => { const i = presets.findIndex(p => p.id === id); const j = i + dir; if (j < 0 || j >= presets.length) return; const a = [...presets]; [a[i], a[j]] = [a[j], a[i]]; onSave(a); };
+  return (
+    <div style={{display:"flex", flexDirection:"column", gap:14}}>
+      <div className="card" style={{display:"flex", flexDirection:"column", gap:12}}>
+        <div style={{fontSize:13, color:"#64748b", textTransform:"uppercase", letterSpacing:1.2, fontWeight:800}}>Ajouter un bouton</div>
+        <div style={{display:"grid", gridTemplateColumns:"70px 1fr", gap:8}}>
+          <input className="ifield" value={icon} onChange={e => setIcon(e.target.value)} placeholder="🍲" style={{textAlign:"center", fontSize:24, padding:"10px 4px"}}/>
+          <input className="ifield" value={label} onChange={e => setLabel(e.target.value)} placeholder="Nom du produit"/>
+        </div>
+        <div style={{display:"flex", gap:8}}>{["refroid", "surgel"].map(m => <button key={m} onClick={() => setMode(m)} className={`chip${mode === m ? " on" : ""}`} style={{flex:1}}>{CELL_MODES[m].icon} {CELL_MODES[m].label}</button>)}</div>
+        <Toggle on={ask} onChange={setAsk} label="Demander le nom au lancement" sub="Pour « Plat du jour », « Autre »…"/>
+        <button className="btnP" onClick={add} disabled={!label.trim()}>+ Ajouter</button>
+        {flash && <div style={{fontSize:14, color:"#15803d", fontWeight:800}}>{flash}</div>}
+      </div>
+      {["refroid", "surgel"].map(m => (
+        <div key={m} className="card">
+          <div style={{fontSize:13, color:CELL_MODES[m].color, textTransform:"uppercase", letterSpacing:1.2, fontWeight:900, marginBottom:6}}>{CELL_MODES[m].icon} {CELL_MODES[m].label}</div>
+          {presets.filter(p => (p.mode === "surgel" ? "surgel" : "refroid") === m).map(p => (
+            <div key={p.id} className="row" style={{display:"flex", alignItems:"center", gap:8}}>
+              <span style={{fontSize:24, width:32, textAlign:"center"}}>{p.icon}</span>
+              <span style={{flex:1, fontSize:16, fontWeight:700}}>{p.label}{p.ask && <span style={{fontSize:12, color:"#94a3b8"}}> · nom demandé</span>}</span>
+              <button className="btnEdit" onClick={() => move(p.id, -1)}>↑</button>
+              <button className="btnEdit" onClick={() => move(p.id, 1)}>↓</button>
+              <button className="btnDel" onClick={() => rm(p.id)}>✕</button>
+            </div>
+          ))}
+        </div>
+      ))}
+      <div className="card" style={{display:"flex", flexDirection:"column", gap:10}}>
+        <div style={{fontSize:13, color:"#64748b", textTransform:"uppercase", letterSpacing:1.2, fontWeight:800}}>🧊 Durée de conservation après surgélation</div>
+        <div style={{display:"flex", gap:8, alignItems:"center"}}>
+          <input type="number" min="1" className="ifield" value={dlc} onChange={e => setDlc(e.target.value)} style={{fontSize:22, textAlign:"center", maxWidth:120}}/>
+          <span style={{fontSize:16, fontWeight:700}}>jours</span>
+          <button className="btnS" disabled={!(parseInt(dlc) > 0)} onClick={() => { onDlc(parseInt(dlc)); setFlash("✓ Durée enregistrée"); setTimeout(() => setFlash(""), 2000); }}>Enregistrer</button>
+        </div>
+        <div style={{fontSize:13, color:"#94a3b8"}}>Affichée à la clôture du cycle pour l'étiquette.</div>
+      </div>
     </div>
   );
 }
@@ -1770,16 +2369,18 @@ function ModuleSemaine({temps,huiles,services,nettoyages,ncs}){
 }
 
 // ══════ PARAMÈTRES ════════════════════════════
-function ModuleSettings({agents,onSaveAgents,fourns,onSaveFourns,unites,onSaveUnites,pndPlan,onSavePnd,onLogout}){
+function ModuleSettings({agents,onSaveAgents,fourns,onSaveFourns,unites,onSaveUnites,pndPlan,onSavePnd,cellPresets,onSaveCellPresets,cellDlc,onSaveCellDlc,planning,onSavePlanning,alarmCfg,onSaveAlarmCfg,onLogout}){
   const [section,setSection]=useState("agents");
   return(
     <div style={{display:"flex",flexDirection:"column",gap:14}}>
       <div style={{fontSize:28,fontWeight:900,color:"#1e293b"}}>⚙ Paramètres</div>
-      <TBar opts={[{id:"agents",label:"👥 Équipe"},{id:"fourns",label:"📦 Fournisseurs"},{id:"unites",label:"🌡 Équipements"},{id:"pnd",label:"🧹 Nettoyage"}]} active={section} onChange={setSection}/>
+      <TBar opts={[{id:"agents",label:"👥 Équipe"},{id:"fourns",label:"📦 Fournisseurs"},{id:"unites",label:"🌡 Équipements"},{id:"pnd",label:"🧹 Nettoyage"},{id:"cellule",label:"❄ Cellule"},{id:"alarmes",label:"🔔 Alarmes"}]} active={section} onChange={setSection}/>
       {section==="agents"  && <SettingsAgents  agents={agents}  onSave={onSaveAgents}/>}
       {section==="fourns"  && <SettingsFourns  fourns={fourns}  onSave={onSaveFourns}/>}
       {section==="unites"  && <SettingsUnites  unites={unites}  onSave={onSaveUnites}/>}
       {section==="pnd"     && <SettingsPnd     pndPlan={pndPlan} onSave={onSavePnd}/>}
+      {section==="cellule" && <SettingsCellule presets={cellPresets} onSave={onSaveCellPresets} dlcJours={cellDlc} onDlc={onSaveCellDlc}/>}
+      {section==="alarmes" && <SettingsAlarmes cfg={alarmCfg} onCfg={onSaveAlarmCfg} planning={planning} onPlanning={onSavePlanning}/>}
       <div className="card" style={{display:"flex",flexDirection:"column",gap:10}}>
         <div style={{fontSize:14,fontWeight:900,color:"#b45309",textTransform:"uppercase",letterSpacing:.5}}>🔐 Mot de passe actuel</div>
         <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:"10px 14px",fontFamily:"'JetBrains Mono',monospace",fontSize:15,color:"#b45309",fontWeight:700}}>{APP_PASSWORD}</div>
@@ -2009,6 +2610,23 @@ function ConfBanner({ok,detail,bad,good}){
       {ok&&good&&<div style={{fontSize:14,color:"#15803d",marginTop:4,fontWeight:700}}>{good}</div>}
     </div>
   </div>);
+}
+// Bloc « Problème / remarque » en bas des saisies : conseil si hors plage + remarque rattachée au dernier relevé
+function ProblemeBloc({last,lastTxt,badTxt,note,setNote,onNote,noteFlash,onNC,extra}){
+  return(
+    <div className="card" style={{display:"flex",flexDirection:"column",gap:12,borderTop:"3px solid #cbd5e1"}}>
+      <div style={{fontSize:13,color:"#64748b",textTransform:"uppercase",letterSpacing:1.2,fontWeight:800}}>⚠ Problème ou remarque</div>
+      {badTxt&&<ConfBanner ok={false} detail={lastTxt} bad={badTxt}/>}
+      <FB label="Remarque sur le dernier relevé" sub={last?lastTxt:"Enregistre d'abord un relevé, puis ajoute ta remarque ici."}>
+        <div style={{display:"flex",gap:8}}>
+          <input className="ifield" value={note} onChange={e=>setNote(e.target.value)} disabled={!last} onKeyDown={e=>e.key==="Enter"&&onNote()} placeholder="ex. porte entrouverte, livraison chaude..."/>
+          <button className="btnS" onClick={onNote} disabled={!last||!note.trim()} style={{flexShrink:0,minWidth:72}}>{noteFlash?"✓":"Ajouter"}</button>
+        </div>
+      </FB>
+      {extra}
+      <button onClick={onNC} style={{background:"#fef2f2",border:"2px solid #fca5a5",borderRadius:12,color:"#dc2626",fontFamily:"inherit",fontSize:15,fontWeight:800,padding:"12px",cursor:"pointer",width:"100%",minHeight:52}}>⚠ Ouvrir une fiche Problème</button>
+    </div>
+  );
 }
 function SmConf({ok}){ return <div style={{fontSize:15,fontWeight:800,color:ok?"#22c55e":"#ef4444",padding:"8px 14px",background:ok?"#f0fdf4":"#fef2f2",borderRadius:10}}>{ok?"✅ CONFORME":"🚨 NON CONFORME"}</div>; }
 function ABtns({onEdit,onDel}){
