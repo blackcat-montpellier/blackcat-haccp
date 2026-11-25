@@ -7,7 +7,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
   <meta name="apple-mobile-web-app-title" content="HACCP Black Cat"/>
-  <meta name="theme-color" content="#1e293b"/>
+  <meta name="theme-color" content="#0f1115"/>
   <title>HACCP — The Black Cat</title>
   <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
@@ -19,7 +19,15 @@
     html { font-size: 18px; }
     body { margin:0; padding:0; background:#0a0c10; font-family:'Barlow Condensed',system-ui,sans-serif; color:#e2e8f0; }
     * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+    /* Apparence sombre (par défaut) : inversion des couleurs, teintes conservées */
+    html.dark { background:#0f1115; }
+    html.dark body { background:#f1f5f9; filter:invert(0.9) hue-rotate(180deg); min-height:100vh; }
+    html.dark img, html.dark video, html.dark .emo { filter:invert(1) hue-rotate(180deg); }
   </style>
+  <script>
+    // appliqué avant l'affichage pour éviter un flash blanc à l'ouverture
+    try{ if((localStorage.getItem("bc_theme")||"dark")==="dark") document.documentElement.classList.add("dark"); }catch(e){}
+  </script>
 
   <script>
   // ── Nettoyage service workers obsolètes ──
@@ -691,7 +699,7 @@ function AppMain({onLogout}){
       <div className="tabBar" style={{position:"sticky",top:58,zIndex:99}}>
         {TABS.map(t=>(
           <button key={t.id} className={`tabBtn${tab===t.id?" active":""}`} onClick={()=>setTab(t.id)}>
-            <div style={{fontSize:18,lineHeight:1,marginBottom:2}}>{t.icon}</div>
+            <div className="emo" style={{fontSize:18,lineHeight:1,marginBottom:2}}>{t.icon}</div>
             <div>{t.short}</div>
           </button>
         ))}
@@ -960,7 +968,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,planning,onSho
       {rappels.length>0&&rappels.map((r,i)=>(
         <button key={i} onClick={()=>onShortcut(r.tab)}
           style={{background:r.bg,border:`2px solid ${r.border}`,borderRadius:14,padding:"14px 16px",display:"flex",alignItems:"center",gap:12,cursor:"pointer",fontFamily:"inherit",width:"100%",textAlign:"left"}}>
-          <span style={{fontSize:28,flexShrink:0}}>{r.icon}</span>
+          <span className="emo" style={{fontSize:28,flexShrink:0}}>{r.icon}</span>
           <div style={{flex:1}}>
             <div style={{fontSize:16,fontWeight:900,color:r.color}}>{r.titre}</div>
             <div style={{fontSize:13,color:r.color,opacity:.8,marginTop:2}}>{r.detail}</div>
@@ -974,7 +982,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,planning,onSho
       <div style={{display:"flex",flexDirection:"column",gap:10}}>
         <button className="shortcut" onClick={()=>onShortcut("temps")}
           style={{background:"#eff6ff",border:"2px solid #3b82f6",color:"#1e40af"}}>
-          <span style={{fontSize:32}}>🌡</span>
+          <span className="emo" style={{fontSize:32}}>🌡</span>
           <div style={{textAlign:"left"}}>
             <div style={{fontSize:19,fontWeight:900,color:"#1e40af"}}>Saisir une température</div>
             <div style={{fontSize:14,color:"#2563eb",fontWeight:600}}>Frigos et congélateurs</div>
@@ -985,7 +993,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,planning,onSho
         {(()=>{ const ec=cellules.filter(c=>c.statut==="en_cours"); const dep=ec.filter(c=>minDepuis(c.tsDebut)>cellMode(c).limite); return (
         <button className="shortcut" onClick={()=>onShortcut("cellule")}
           style={{background:dep.length?"#fef2f2":"#f0f9ff",border:`2px solid ${dep.length?"#ef4444":"#38bdf8"}`,color:"#0369a1"}}>
-          <span style={{fontSize:32}}>❄</span>
+          <span className="emo" style={{fontSize:32}}>❄</span>
           <div style={{textAlign:"left"}}>
             <div style={{fontSize:19,fontWeight:900,color:dep.length?"#dc2626":"#0369a1"}}>Lancer un refroidissement</div>
             <div style={{fontSize:14,color:dep.length?"#dc2626":"#0284c7",fontWeight:600}}>
@@ -997,7 +1005,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,planning,onSho
 
         <button className="shortcut" onClick={()=>onShortcut("nettoyage")}
           style={{background:"#f0fdf4",border:"2px solid #22c55e",color:"#15803d"}}>
-          <span style={{fontSize:32}}>🧹</span>
+          <span className="emo" style={{fontSize:32}}>🧹</span>
           <div style={{textAlign:"left"}}>
             <div style={{fontSize:19,fontWeight:900,color:"#15803d"}}>Valider une tâche ménage</div>
             <div style={{fontSize:14,color:"#16a34a",fontWeight:600}}>
@@ -1009,7 +1017,7 @@ function Dashboard({temps,huiles,ncs,cellules,services,nettoyages,planning,onSho
 
         <button className="shortcut" onClick={()=>onShortcut("nc")}
           style={{background:"#fef2f2",border:"2px solid #fca5a5",color:"#dc2626"}}>
-          <span style={{fontSize:32}}>⚠️</span>
+          <span className="emo" style={{fontSize:32}}>⚠️</span>
           <div style={{textAlign:"left"}}>
             <div style={{fontSize:19,fontWeight:900,color:"#dc2626"}}>Signaler un problème</div>
             <div style={{fontSize:14,color:"#dc2626",fontWeight:600}}>
@@ -1587,7 +1595,7 @@ function ModuleCellule({cellules, onPatch, agents, presets, dlcJours, onShortcut
         {liste.map(p => (
           <button key={p.id} onClick={() => tap(p)}
             style={{minHeight:86, padding:"10px 6px", borderRadius:14, border:`2px solid ${M.border}`, background:M.bg, color:"#1e293b", fontFamily:"inherit", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:4}}>
-            <span style={{fontSize:30, lineHeight:1}}>{p.icon || M.icon}</span>
+            <span className="emo" style={{fontSize:30, lineHeight:1}}>{p.icon || M.icon}</span>
             <span style={{fontSize:14, fontWeight:800, lineHeight:1.15, textAlign:"center"}}>{p.label}</span>
           </button>
         ))}
@@ -1805,7 +1813,7 @@ function AlarmBanner({alarms, onAck, onSnooze, onGo}){
   return (
     <div style={{position:"sticky", top:120, zIndex:150, margin:"0 0 14px", background:urgent?"#dc2626":"#f59e0b", color:urgent?"#fff":"#1e293b", borderRadius:16, padding:"14px 14px 12px", boxShadow:"0 6px 24px rgba(0,0,0,.25)"}}>
       <div style={{display:"flex", gap:10, alignItems:"flex-start"}}>
-        <span className="pulseR" style={{fontSize:30, lineHeight:1}}>🔔</span>
+        <span className="pulseR emo" style={{fontSize:30, lineHeight:1}}>🔔</span>
         <div style={{flex:1, minWidth:0}}>
           <div style={{fontSize:19, fontWeight:900, lineHeight:1.2}}>{a.titre}</div>
           <div style={{fontSize:15, fontWeight:700, marginTop:3, lineHeight:1.35}}>{a.txt}</div>
@@ -1881,6 +1889,16 @@ function Toggle({on, onChange, label, sub, disabled}){
   );
 }
 
+// Apparence : propre à chaque appareil
+function ThemeCard(){
+  const [dark,setDark]=useState(()=>document.documentElement.classList.contains("dark"));
+  const set=(v)=>{ setDark(v); document.documentElement.classList.toggle("dark",v); try{ window.localStorage.setItem("bc_theme",v?"dark":"light"); }catch(e){} };
+  return(
+    <div className="card">
+      <Toggle on={dark} onChange={set} label="🌙 Apparence sombre" sub="Plus doux pour les yeux. Réglage propre à cet appareil."/>
+    </div>
+  );
+}
 function SettingsAlarmes({cfg, onCfg, planning, onPlanning}){
   const set = (k, v) => onCfg({...cfg, [k]: v});
   const perm = ("Notification" in window) ? Notification.permission : "indispo";
@@ -1977,7 +1995,7 @@ function SettingsCellule({presets, onSave, dlcJours, onDlc}){
           <div style={{fontSize:13, color:CELL_MODES[m].color, textTransform:"uppercase", letterSpacing:1.2, fontWeight:900, marginBottom:6}}>{CELL_MODES[m].icon} {CELL_MODES[m].label}</div>
           {presets.filter(p => (p.mode === "surgel" ? "surgel" : "refroid") === m).map(p => (
             <div key={p.id} className="row" style={{display:"flex", alignItems:"center", gap:8}}>
-              <span style={{fontSize:24, width:32, textAlign:"center"}}>{p.icon}</span>
+              <span className="emo" style={{fontSize:24, width:32, textAlign:"center"}}>{p.icon}</span>
               <span style={{flex:1, fontSize:16, fontWeight:700}}>{p.label}{p.ask && <span style={{fontSize:12, color:"#94a3b8"}}> · nom demandé</span>}</span>
               <button className="btnEdit" onClick={() => move(p.id, -1)}>↑</button>
               <button className="btnEdit" onClick={() => move(p.id, 1)}>↓</button>
@@ -2381,10 +2399,11 @@ function ModuleSettings({agents,onSaveAgents,fourns,onSaveFourns,unites,onSaveUn
       {section==="pnd"     && <SettingsPnd     pndPlan={pndPlan} onSave={onSavePnd}/>}
       {section==="cellule" && <SettingsCellule presets={cellPresets} onSave={onSaveCellPresets} dlcJours={cellDlc} onDlc={onSaveCellDlc}/>}
       {section==="alarmes" && <SettingsAlarmes cfg={alarmCfg} onCfg={onSaveAlarmCfg} planning={planning} onPlanning={onSavePlanning}/>}
+      <ThemeCard/>
       <div className="card" style={{display:"flex",flexDirection:"column",gap:10}}>
         <div style={{fontSize:14,fontWeight:900,color:"#b45309",textTransform:"uppercase",letterSpacing:.5}}>🔐 Mot de passe actuel</div>
         <div style={{background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:10,padding:"10px 14px",fontFamily:"'JetBrains Mono',monospace",fontSize:15,color:"#b45309",fontWeight:700}}>{APP_PASSWORD}</div>
-        <div style={{fontSize:12,color:"#94a3b8"}}>Modifier : fichier HTML → chercher APP_PASSWORD → redéposer sur Netlify</div>
+        <div style={{fontSize:12,color:"#94a3b8"}}>Modifier : fichier HTML → chercher APP_PASSWORD → redéposer sur GitHub</div>
       </div>
       <button onClick={onLogout} style={{background:"#fef2f2",border:"2px solid #fecaca",borderRadius:14,padding:"16px",color:"#dc2626",fontFamily:"inherit",fontSize:17,fontWeight:900,cursor:"pointer"}}>
         🚪 Se déconnecter
@@ -2395,15 +2414,25 @@ function ModuleSettings({agents,onSaveAgents,fourns,onSaveFourns,unites,onSaveUn
 }
 
 // ── Section Agents ──
+// ── Réordonner une liste (↑ / ↓) ──
+const swapIdx=(arr,i,j)=>{ if(i<0||j<0||i>=arr.length||j>=arr.length) return arr; const a=[...arr]; [a[i],a[j]]=[a[j],a[i]]; return a; };
+function UpDown({onUp,onDown,first,last}){
+  const st=(dis)=>({width:40,height:40,borderRadius:8,border:"1.5px solid #cbd5e1",background:"#fff",color:dis?"#cbd5e1":"#475569",fontFamily:"inherit",fontSize:18,fontWeight:900,cursor:dis?"default":"pointer",flexShrink:0,padding:0});
+  return(<div style={{display:"flex",gap:4,flexShrink:0}}>
+    <button type="button" aria-label="Monter" disabled={first} onClick={onUp} style={st(first)}>↑</button>
+    <button type="button" aria-label="Descendre" disabled={last} onClick={onDown} style={st(last)}>↓</button>
+  </div>);
+}
 function SettingsAgents({agents,onSave}){
   const [name,setName]=useState(""); const [flash,setFlash]=useState("");
   const add=()=>{ const n=name.trim(); if(!n||agents.includes(n)) return; onSave([...agents,n]); setName(""); setFlash("✓ Ajouté !"); setTimeout(()=>setFlash(""),2000); };
   const rm=(a)=>{ if(agents.length<=1){setFlash("⚠ Minimum 1");setTimeout(()=>setFlash(""),2000);return;} if(window.confirm(`Retirer "${a}" ?`)) onSave(agents.filter(x=>x!==a)); };
   return(<div style={{display:"flex",flexDirection:"column",gap:10}}>
     <div style={{fontSize:13,color:"#64748b"}}>Ces noms apparaissent dans tous les modules pour identifier qui fait la saisie.</div>
-    {agents.map(a=>(
-      <div key={a} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"12px 16px"}}>
-        <div style={{fontSize:16,fontWeight:700,color:"#1e293b"}}>👤 {a}</div>
+    {agents.map((a,i)=>(
+      <div key={a} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"10px 12px"}}>
+        <UpDown first={i===0} last={i===agents.length-1} onUp={()=>onSave(swapIdx(agents,i,i-1))} onDown={()=>onSave(swapIdx(agents,i,i+1))}/>
+        <div style={{flex:1,fontSize:16,fontWeight:700,color:"#1e293b"}}>👤 {a}</div>
         <button onClick={()=>rm(a)} style={{background:"#fef2f2",border:"1.5px solid #fecaca",borderRadius:8,padding:"6px 12px",color:"#dc2626",fontFamily:"inherit",fontSize:13,fontWeight:800,cursor:"pointer"}}>Retirer</button>
       </div>
     ))}
@@ -2423,9 +2452,10 @@ function SettingsFourns({fourns,onSave}){
   const rm=(f)=>{ if(fourns.length<=1){setFlash("⚠ Minimum 1");setTimeout(()=>setFlash(""),2000);return;} if(window.confirm(`Retirer "${f}" ?`)) onSave(fourns.filter(x=>x!==f)); };
   return(<div style={{display:"flex",flexDirection:"column",gap:10}}>
     <div style={{fontSize:13,color:"#64748b"}}>Liste des fournisseurs proposés lors d'une réception de marchandises.</div>
-    {fourns.map(f=>(
-      <div key={f} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"12px 16px"}}>
-        <div style={{fontSize:16,fontWeight:700,color:"#1e293b"}}>📦 {f}</div>
+    {fourns.map((f,i)=>(
+      <div key={f} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"10px 12px"}}>
+        <UpDown first={i===0} last={i===fourns.length-1} onUp={()=>onSave(swapIdx(fourns,i,i-1))} onDown={()=>onSave(swapIdx(fourns,i,i+1))}/>
+        <div style={{flex:1,fontSize:16,fontWeight:700,color:"#1e293b"}}>📦 {f}</div>
         <button onClick={()=>rm(f)} style={{background:"#fef2f2",border:"1.5px solid #fecaca",borderRadius:8,padding:"6px 12px",color:"#dc2626",fontFamily:"inherit",fontSize:13,fontWeight:800,cursor:"pointer"}}>Retirer</button>
       </div>
     ))}
@@ -2452,7 +2482,7 @@ function SettingsUnites({unites,onSave}){
   const TempFields=()=>(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><FB label="T° min (°C)"><SignNum value={minT} onChange={setMinT} style={{textAlign:"center",fontSize:18,fontFamily:"'JetBrains Mono',monospace"}}/></FB><FB label="T° max (°C)"><SignNum value={maxT} onChange={setMaxT} style={{textAlign:"center",fontSize:18,fontFamily:"'JetBrains Mono',monospace"}}/></FB></div>);
   return(<div style={{display:"flex",flexDirection:"column",gap:10}}>
     <div style={{fontSize:13,color:"#64748b"}}>Frigos, congélateurs et équipements — modifier le nom et les plages de température.</div>
-    {unites.map(u=>(
+    {unites.map((u,i)=>(
       <div key={u.id}>
         {editId===u.id?(
           <div className="card" style={{display:"flex",flexDirection:"column",gap:10,border:"2px solid #f59e0b"}}>
@@ -2465,8 +2495,9 @@ function SettingsUnites({unites,onSave}){
             </div>
           </div>
         ):(
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"12px 16px"}}>
-            <div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"10px 12px"}}>
+            <UpDown first={i===0} last={i===unites.length-1} onUp={()=>onSave(swapIdx(unites,i,i-1))} onDown={()=>onSave(swapIdx(unites,i,i+1))}/>
+            <div style={{flex:1,minWidth:0}}>
               <div style={{fontSize:15,fontWeight:700,color:"#1e293b"}}>🌡 {u.label}</div>
               <div style={{fontSize:12,color:"#64748b"}}>{u.type==="froid"?`Froid : ${u.min} à ${u.max}°C`:`Congélation : ≤ ${u.max}°C`}</div>
             </div>
@@ -2517,8 +2548,11 @@ function SettingsPnd({pndPlan,onSave}){
       return taches.length>0?(
         <div key={f}>
           <div style={{fontSize:13,fontWeight:900,color:f==="Journalier"?"#b45309":f==="Hebdomadaire"?"#1d4ed8":"#7c3aed",textTransform:"uppercase",letterSpacing:1,marginBottom:6}}>{f} ({taches.length})</div>
-          {taches.map(t=>(
-            <div key={t.id} style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"10px 14px",marginBottom:6}}>
+          {taches.map((t,k)=>(
+            <div key={t.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8,background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:11,padding:"10px 12px",marginBottom:6}}>
+              <UpDown first={k===0} last={k===taches.length-1}
+                onUp={()=>onSave(swapIdx(pndPlan,pndPlan.indexOf(t),pndPlan.indexOf(taches[k-1])))}
+                onDown={()=>onSave(swapIdx(pndPlan,pndPlan.indexOf(t),pndPlan.indexOf(taches[k+1])))}/>
               <div style={{flex:1,minWidth:0}}>
                 <div style={{fontSize:14,fontWeight:700,color:"#1e293b"}}>{t.zone} — {t.tache}</div>
                 <div style={{fontSize:12,color:"#94a3b8",marginTop:2}}>{t.moment} · {t.produit} ({t.dilution})</div>
