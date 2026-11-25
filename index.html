@@ -1161,9 +1161,9 @@ function ModuleTemps({temps,onSave,autoOpen,agents,unites:unitesProp,onShortcut}
           </FB>
           <div>
             <label className="fieldLabel">Température relevée (°C)</label>
-            <input type="number" inputMode="decimal" step="0.1" className="ifield" value={temp} onChange={e=>setTemp(e.target.value)}
+            <SignNum big step="0.1" value={temp} onChange={setTemp} defaultNeg={u.type!=="froid"}
               onKeyDown={e=>e.key==="Enter"&&submit()}
-              placeholder={u.type==="froid"?"ex. 2.5":"ex. -20"}
+              placeholder={u.type==="froid"?"ex. 2.5":"ex. 20"}
               style={{fontSize:42,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,padding:"18px",
                 borderColor:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b",
                 color:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b"}}/>
@@ -1224,7 +1224,7 @@ function EditTemps({item,onSave,onClose,agents}){
   const u=UNITES.find(x=>x.id===uid)||UNITES[0]; const ok=temp!==""?isOK(u,temp):null;
   return(<>
     <FB label="Unité"><select className="ifield" value={uid} onChange={e=>setUid(e.target.value)}>{UNITES.map(u=><option key={u.id} value={u.id}>{u.label}</option>)}</select></FB>
-    <FB label="Température (°C)"><input type="number" step="0.1" className="ifield" value={temp} onChange={e=>setTemp(e.target.value)} style={{fontSize:34,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b"}}/></FB>
+    <FB label="Température (°C)"><SignNum step="0.1" value={temp} onChange={setTemp} defaultNeg={u.type!=="froid"} style={{fontSize:34,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:ok===false?"#ef4444":ok===true?"#22c55e":"#1e293b"}}/></FB>
     {ok!==null&&<SmConf ok={ok}/>}
     <FB label="Agent"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
     <FB label="Remarque"><input className="ifield" value={note} onChange={e=>setNote(e.target.value)}/></FB>
@@ -1746,7 +1746,7 @@ function CycleCard({c, dlcJours, onUpdate, onDel, onShortcut}){
       {el > M.limite && <div style={{fontSize:14, color:"#dc2626", fontWeight:900}}>⚠ Temps dépassé de {fDuree(el - M.limite)} — sonder maintenant</div>}
 
       <FB label={`T° à cœur à la sortie · cible ${M.cibleTxt}`}>
-        <input type="number" inputMode="decimal" step="0.5" className="ifield" value={tFin} onChange={e => setTFin(e.target.value)} placeholder={c.mode==="surgel"?"ex. -19":"ex. 6"}
+        <SignNum big step="0.5" value={tFin} onChange={setTFin} defaultNeg={c.mode==="surgel"} placeholder={c.mode==="surgel"?"ex. 19":"ex. 6"}
           style={{fontSize:42, fontFamily:"'JetBrains Mono',monospace", textAlign:"center", fontWeight:700, padding:"8px",
             borderColor:okPreview===true?"#22c55e":okPreview===false?"#ef4444":"#cbd5e1", color:okPreview===true?"#15803d":okPreview===false?"#dc2626":"#1e293b"}}/>
       </FB>
@@ -1787,7 +1787,7 @@ function EditCellule({item,onSave,onClose,agents}){
     <div style={{fontSize:14,fontWeight:800,color:M.color}}>{M.icon} {M.label} · cible {M.cibleTxt} en {fDuree(M.limite)} max</div>
     <FB label="Produit"><input className="ifield" value={produit} onChange={e=>setProduit(e.target.value)}/></FB>
     <FB label="T° départ (°C)"><input type="number" step="0.5" className="ifield" value={tDepart} onChange={e=>setTDepart(e.target.value)} style={{fontSize:28,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700}}/></FB>
-    <FB label="T° fin (°C)"><input type="number" step="0.5" className="ifield" value={tFin} onChange={e=>setTFin(e.target.value)} style={{fontSize:28,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:ok===true?"#22c55e":ok===false?"#ef4444":"#e2e8f0"}}/></FB>
+    <FB label="T° fin (°C)"><SignNum step="0.5" value={tFin} onChange={setTFin} defaultNeg={item.mode==="surgel"} style={{fontSize:28,fontFamily:"'JetBrains Mono',monospace",textAlign:"center",fontWeight:700,borderColor:ok===true?"#22c55e":ok===false?"#ef4444":"#e2e8f0"}}/></FB>
     {dureeMin!=null&&<div style={{fontSize:14,color:"#94a3b8",fontWeight:700}}>Durée calculée : <b style={{color:dureeMin<=M.limite?"#22c55e":"#ef4444"}}>{fDuree(dureeMin)}</b></div>}
     {ok!==null&&<SmConf ok={ok}/>}
     <FB label="Agent"><ChipR opts={agents||AGENTS_DEFAULT} active={agent} onChange={setAgent}/></FB>
@@ -2449,7 +2449,7 @@ function SettingsUnites({unites,onSave}){
   const add=()=>{ const l=label.trim(); if(!l) return; onSave([...unites,{id:"u_"+Date.now(),label:l,type,min:parseFloat(minT),max:parseFloat(maxT)}]); setLabel(""); setShowForm(false); setFlash("✓ Ajouté !"); setTimeout(()=>setFlash(""),2000); };
   const rm=(id)=>{ if(unites.length<=1){setFlash("⚠ Minimum 1");setTimeout(()=>setFlash(""),2000);return;} if(window.confirm("Supprimer cette unité ?")) onSave(unites.filter(u=>u.id!==id)); };
   const TypeBtns=()=>(<div style={{display:"flex",gap:8}}>{["froid","congelation"].map(t=>(<button key={t} onClick={()=>{setType(t);if(t==="congelation"){setMinT("-30");setMaxT("-18");}else{setMinT("0");setMaxT("4");}}} className={`chip${type===t?" on":""}`} style={{flex:1}}>{t==="froid"?"❄ Froid positif":"🧊 Congélation"}</button>))}</div>);
-  const TempFields=()=>(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><FB label="T° min (°C)"><input type="number" className="ifield" value={minT} onChange={e=>setMinT(e.target.value)} style={{textAlign:"center",fontSize:18,fontFamily:"'JetBrains Mono',monospace"}}/></FB><FB label="T° max (°C)"><input type="number" className="ifield" value={maxT} onChange={e=>setMaxT(e.target.value)} style={{textAlign:"center",fontSize:18,fontFamily:"'JetBrains Mono',monospace"}}/></FB></div>);
+  const TempFields=()=>(<div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}><FB label="T° min (°C)"><SignNum value={minT} onChange={setMinT} style={{textAlign:"center",fontSize:18,fontFamily:"'JetBrains Mono',monospace"}}/></FB><FB label="T° max (°C)"><SignNum value={maxT} onChange={setMaxT} style={{textAlign:"center",fontSize:18,fontFamily:"'JetBrains Mono',monospace"}}/></FB></div>);
   return(<div style={{display:"flex",flexDirection:"column",gap:10}}>
     <div style={{fontSize:13,color:"#64748b"}}>Frigos, congélateurs et équipements — modifier le nom et les plages de température.</div>
     {unites.map(u=>(
@@ -2458,7 +2458,7 @@ function SettingsUnites({unites,onSave}){
           <div className="card" style={{display:"flex",flexDirection:"column",gap:10,border:"2px solid #f59e0b"}}>
             <div style={{fontSize:13,fontWeight:800,color:"#b45309",textTransform:"uppercase"}}>✏ Modifier — {u.label}</div>
             <input className="ifield" value={label} onChange={e=>setLabel(e.target.value)} placeholder="Nom de l'unité"/>
-            <TypeBtns/><TempFields/>
+            <TypeBtns/>{TempFields()}
             <div style={{display:"flex",gap:8}}>
               <button onClick={()=>setEditId(null)} style={{flex:1,padding:"12px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:10,color:"#94a3b8",fontFamily:"inherit",fontSize:14,cursor:"pointer",fontWeight:700}}>Annuler</button>
               <button onClick={saveEdit} disabled={!label.trim()} style={{flex:2,background:"#f59e0b",border:"none",borderRadius:12,padding:"12px",color:"#1e293b",fontFamily:"inherit",fontSize:15,fontWeight:900,cursor:"pointer"}}>💾 Sauvegarder</button>
@@ -2485,7 +2485,7 @@ function SettingsUnites({unites,onSave}){
       <div className="card" style={{display:"flex",flexDirection:"column",gap:10}}>
         <div style={{fontSize:13,fontWeight:800,color:"#475569",textTransform:"uppercase",letterSpacing:1}}>Nouvelle unité</div>
         <input className="ifield" value={label} onChange={e=>setLabel(e.target.value)} placeholder="ex. Frigo 6, Saladette 2..."/>
-        <TypeBtns/><TempFields/>
+        <TypeBtns/>{TempFields()}
         <div style={{display:"flex",gap:8}}>
           <button onClick={()=>setShowForm(false)} style={{flex:1,padding:"12px",background:"transparent",border:"1px solid #e2e8f0",borderRadius:10,color:"#94a3b8",fontFamily:"inherit",fontSize:14,cursor:"pointer",fontWeight:700}}>Annuler</button>
           <button onClick={add} disabled={!label.trim()} style={{flex:2,background:"#22c55e",border:"none",borderRadius:12,padding:"12px",color:"#fff",fontFamily:"inherit",fontSize:15,fontWeight:900,cursor:"pointer"}}>+ Ajouter</button>
@@ -2610,6 +2610,28 @@ function ConfBanner({ok,detail,bad,good}){
       {ok&&good&&<div style={{fontSize:14,color:"#15803d",marginTop:4,fontWeight:700}}>{good}</div>}
     </div>
   </div>);
+}
+// Champ température avec bouton +/− (le clavier numérique de l'iPhone n'a pas de touche « − »)
+// defaultNeg : le champ démarre en négatif (congélateurs, surgélation)
+function SignNum({value,onChange,defaultNeg,style,big,...rest}){
+  const v=value==null?"":String(value);
+  const [neg,setNeg]=useState(v!==""?v.startsWith("-"):!!defaultNeg);
+  useEffect(()=>{ if(v==="") setNeg(!!defaultNeg); },[v==="",defaultNeg]);
+  useEffect(()=>{ if(v!=="") setNeg(v.startsWith("-")); },[v]);
+  const abs=v.replace(/^-/,"");
+  const emit=(a,n)=>onChange(a===""?"":(n?"-":"")+a);
+  return(
+    <div style={{display:"flex",gap:8,alignItems:"stretch"}}>
+      <button type="button" onClick={()=>{ setNeg(!neg); emit(abs,!neg); }} aria-label="Changer le signe"
+        style={{width:big?76:60,flexShrink:0,borderRadius:12,border:`2px solid ${neg?"#0369a1":"#cbd5e1"}`,background:neg?"#e0f2fe":"#fff",
+          color:neg?"#0369a1":"#64748b",fontFamily:"'JetBrains Mono',monospace",fontSize:big?40:28,fontWeight:900,cursor:"pointer",lineHeight:1}}>
+        {neg?"−":"+"}
+      </button>
+      <input type="number" inputMode="decimal" className="ifield" {...rest} value={abs}
+        onChange={e=>{ let a=e.target.value; let n=neg; if(a.startsWith("-")){ n=true; a=a.slice(1); setNeg(true); } emit(a,n); }}
+        style={{...style,flex:1,minWidth:0}}/>
+    </div>
+  );
 }
 // Bloc « Problème / remarque » en bas des saisies : conseil si hors plage + remarque rattachée au dernier relevé
 function ProblemeBloc({last,lastTxt,badTxt,note,setNote,onNote,noteFlash,onNC,extra}){
